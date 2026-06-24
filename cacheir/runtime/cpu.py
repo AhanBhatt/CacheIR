@@ -5,10 +5,12 @@ from typing import Iterable
 
 import numpy as np
 
+import cacheir.backends.native as native
+from cacheir.importers.gguf import GGUFReader
 from cacheir.quantization import quantize_dequantize
 from cacheir.ir import Graph, Node, WeightSpec
 from cacheir.runtime.artifact import CompileArtifact
-from cacheir.runtime.kv_cache import PagedKVCache
+from cacheir.runtime.kv_cache import PagedKVCache, PrefixCache, SpilloverCostModel, SpilloverPolicy
 from cacheir.runtime.tokenizer import TokenizerBridge
 
 
@@ -18,6 +20,7 @@ class WeightStore:
         self.specs = specs
         self.quant = quant
         self._npz: dict[str, np.ndarray] | None = None
+        self._gguf: GGUFReader | None = None
         self._cache: dict[str, np.ndarray] = {}
 
     def get(self, value_name: str) -> np.ndarray:
@@ -42,7 +45,9 @@ class WeightStore:
             with safe_open(self.model_path, framework="np") as handle:
                 return handle.get_tensor(spec.key)
         if self.model_path.is_file() and self.model_path.suffix == ".gguf":
-            raise RuntimeError("GGUF metadata compilation is supported; GGUF tensor data execution is not implemented in the reference runtime")
+            if self._gguf is None:
+                self._gguf = GGUFReader(self.model_path)
+            return self._gguf.read_tensor(spec.key)
         if self.model_path.is_dir():
             npz_path = self.model_path / (spec.file or "weights.npz")
             if npz_path.exists():
@@ -71,6 +76,7 @@ class Runtime:
         self.tokenizer = TokenizerBridge(self.artifact.model_path, self.artifact.config.vocab_size)
         page_size = int(graph.attrs.get("execution_hints", {}).get("page_size", 16))
         self.kv_cache = PagedKVCache(page_size=page_size)
+        self.prefix_cache = PrefixCache(capacity=8)
 
     def run(self, input_ids: Iterable[Iterable[int]] | np.ndarray, *, mode: str = "prefill") -> np.ndarray:
         graph = self.artifact.graph(mode)
@@ -100,7 +106,39 @@ class Runtime:
             logits = self.run([[next_id]], mode="decode")
 
     def cache_stats(self) -> dict[str, object]:
-        return self.kv_cache.stats()
+        stats = self.kv_cache.stats()
+        stats["prefix_cache"] = self.prefix_cache.stats()
+        return stats
+
+    def enable_spillover(
+        self,
+        max_resident_pages: int | None = None,
+        *,
+        target: str = "cpu",
+        gpu_free_memory_mb: float | None = None,
+        page_bytes: int | None = None,
+        safety_margin_mb: float = 512.0,
+        pcie_bandwidth_gbps: float = 12.0,
+    ) -> None:
+        observed_page_bytes = page_bytes or self.kv_cache.estimated_page_bytes() or 0
+        cost_model = None
+        if observed_page_bytes or gpu_free_memory_mb is not None:
+            cost_model = SpilloverCostModel(
+                page_bytes=int(observed_page_bytes),
+                gpu_free_memory_mb=gpu_free_memory_mb,
+                safety_margin_mb=safety_margin_mb,
+                pcie_bandwidth_gbps=pcie_bandwidth_gbps,
+            )
+        self.kv_cache.spillover_policy = SpilloverPolicy(max_resident_pages=max_resident_pages, target=target, cost_model=cost_model)
+
+    def remember_prefix(self, token_ids: list[int] | tuple[int, ...]) -> None:
+        self.prefix_cache.put(token_ids, self.kv_cache.snapshot_prefix(len(token_ids)))
+
+    def load_longest_prefix(self, token_ids: list[int] | tuple[int, ...]) -> tuple[int, ...]:
+        prefix, snapshot = self.prefix_cache.longest_prefix(token_ids)
+        if snapshot is not None:
+            self.kv_cache.load_prefix(snapshot)
+        return prefix
 
     def _execute_node(self, graph: Graph, node: Node, env: dict[str, np.ndarray], mode: str) -> list[np.ndarray]:
         op = node.op
@@ -148,11 +186,15 @@ class Runtime:
 
     @staticmethod
     def _rms_norm(x: np.ndarray, weight: np.ndarray, eps: float) -> np.ndarray:
+        if native.available() and x.ndim == 3 and x.dtype == np.float32 and weight.dtype == np.float32:
+            return native.rms_norm(x, weight, eps)
         scale = np.rsqrt(np.mean(np.square(x), axis=-1, keepdims=True) + eps) if hasattr(np, "rsqrt") else 1.0 / np.sqrt(np.mean(np.square(x), axis=-1, keepdims=True) + eps)
         return (x * scale) * weight
 
     @staticmethod
     def _matmul(x: np.ndarray, weight: np.ndarray) -> np.ndarray:
+        if native.available() and x.ndim == 3 and x.dtype == np.float32 and weight.dtype == np.float32:
+            return native.matmul_out_in(x, weight)
         return np.einsum("...i,oi->...o", x, weight, optimize=True)
 
     def _position_offset(self, layer: int, mode: str) -> int:

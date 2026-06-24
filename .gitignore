@@ -12,6 +12,8 @@ build/
 dist/
 *.egg-info/
 cpp/build/
+cpp/build-*/
+.tmp/
 
 # CacheIR generated examples and benchmark outputs
 examples/tiny_model/
@@ -20,6 +22,9 @@ examples/tiny_cacheir_artifact/
 examples/tiny_cacheir_artifact.json
 benchmark_results.json
 benchmark_results.md
+benchmark_comparison.json
+upstream_benchmarks.json
+*.vmfb
 
 # LaTeX / PDF / ODF generated documentation artifacts
 docs/latex/build/

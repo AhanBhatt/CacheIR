@@ -4,6 +4,7 @@ import html
 from pathlib import Path
 
 from cacheir.runtime.artifact import CompileArtifact
+from cacheir.mlir import emit_cacheir_dialect
 
 
 def graph_to_dot(artifact: CompileArtifact, mode: str = "decode") -> str:
@@ -93,6 +94,8 @@ def export_graph(artifact: CompileArtifact, output: str | Path, mode: str = "dec
         content = graph_to_dot(artifact, mode)
     elif fmt == "html":
         content = graph_to_html(artifact, mode)
+    elif fmt == "mlir":
+        content = emit_cacheir_dialect(artifact.graph(mode))
     elif fmt in {"cir", "txt"}:
         content = artifact.graph(mode).to_text()
     else:

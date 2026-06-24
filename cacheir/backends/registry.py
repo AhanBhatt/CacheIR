@@ -40,7 +40,7 @@ def default_registry() -> BackendRegistry:
                 "paged_attention_decode",
                 "fused_swiglu",
             ),
-            notes="NumPy reference runtime today; C++20 AVX/OpenMP skeleton in cpp/.",
+            notes="NumPy reference runtime plus optional C++20/OpenMP AVX2/AVX512 kernels through pybind11.",
         )
     )
     registry.register(
@@ -52,9 +52,16 @@ def default_registry() -> BackendRegistry:
                 "fused_rmsnorm_qkv_rope",
                 "paged_attention_prefill",
                 "paged_attention_decode",
+                "triton_rms_norm",
+                "triton_fused_swiglu",
+                "triton_matmul_f16_tensorcore",
+                "cuda_fused_rmsnorm_qkv_rope",
+                "cuda_matmul_f16_tensorcore",
+                "cuda_paged_attention_decode_batch_reduced",
+                "cuda_graph_decode_replay_plan",
                 "awq_int4_tensorcore",
             ),
-            notes="Compiler target is modeled; Triton/CUDA kernels are the next backend milestone.",
+            notes="Compiler target plus guarded Triton fused kernels, optional CUDA C++ fused-kernel sources, WMMA FP16 Tensor Core matmul, reduced paged-attention decode, and CUDA graph capture planning.",
         )
     )
     return registry

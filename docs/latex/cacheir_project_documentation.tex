@@ -3,6 +3,7 @@
 \usepackage[margin=1in]{geometry}
 \usepackage[T1]{fontenc}
 \usepackage[utf8]{inputenc}
+\usepackage{lmodern}
 \usepackage{array}
 \usepackage{booktabs}
 \usepackage{enumitem}
@@ -84,8 +85,12 @@ The current implementation is a complete reference project. It includes an
 installable Python package, command-line interface, model importer skeletons,
 CacheIR graph IR, compiler passes, artifact bundles, graph visualization,
 benchmarks, a NumPy CPU runtime, a paged KV-cache reference implementation, an
-OpenAI-compatible local server, a C++20 backend skeleton, Docker support, CI, and
-tests.
+OpenAI-compatible local server, prefix-cache and calibrated spillover
+experiments, native GGUF dense and classic quantized block reads, StableHLO and
+MLIR-style round-trip experiments, a C++20/OpenMP AVX backend with an optional
+pybind11 bridge, guarded Triton kernels, optional CUDA fused-kernel sources,
+FP16 Tensor Core matmul experiments, IREE/TVM upstream benchmark bridges,
+accelerator adapter probes, Docker support, CI, and tests.
 
 \section{High-Level Architecture}
 
@@ -115,18 +120,18 @@ executes scheduled graph nodes through backend dispatch. \\
 cacheir/
   ir.py                  CacheIR graph IR
   compiler.py            importer selection and pass pipeline
-  importers/             HF, ONNX, GGUF, tiny model support
+  importers/             HF, ONNX, GGUF, StableHLO, tiny model support
   passes/                compiler optimization passes
   runtime/               artifacts, tokenizer, KV cache, CPU runtime, server
-  backends/              backend registry and target metadata
+  backends/              registry, native bridge, Triton kernels, upstream probes
   benchmark.py           benchmark runner
-  visualize.py           HTML/DOT/IR graph export
+  visualize.py           HTML/DOT/IR/MLIR graph export
   hardware.py            hardware profile discovery
   quantization.py        quantization simulation utilities
-cpp/                     C++20/OpenMP backend skeleton
+cpp/                     C++20/OpenMP AVX backend and pybind11 module
 docs/                    Markdown and LaTeX documentation
 examples/                tiny model compile demo
-scripts/                 benchmark matrix utility
+scripts/                 benchmark matrix and external comparison utilities
 tests/                   pytest coverage
 \end{lstlisting}
 
@@ -145,13 +150,19 @@ NPZ or safetensors tensor shapes, and builds a Llama/Mistral/Qwen-style decoder
 graph. \\
 NPZ tiny model & Reference test path & Used by \texttt{cacheir make-tiny}, tests,
 examples, and benchmarks. \\
-safetensors & Metadata/runtime path & Shape discovery and runtime tensor loading
+safetensors & Metadata path & Shape discovery and runtime tensor loading
 are supported when the optional \texttt{safetensors} dependency is installed. \\
 ONNX & Generic graph skeleton & Imports generic ONNX nodes into CacheIR ops where
 straightforward. Full transformer semantic recovery is not claimed. \\
-GGUF & Metadata subset & Parses GGUF header metadata and tensor directory, maps
-common Llama tensor names, and builds a CacheIR graph. Native GGUF tensor execution
-is planned. \\
+GGUF & Metadata plus native subset & Parses GGUF header metadata and tensor
+directory, maps common Llama tensor names, builds a CacheIR graph, and can read
+dense \texttt{F32}/\texttt{F16}/\texttt{BF16}/\texttt{I8}/\texttt{I16}/\texttt{I32}/\texttt{I64}/\texttt{F64} plus \texttt{Q4\_0}/\texttt{Q4\_1}/\texttt{Q5\_0}/\texttt{Q5\_1}/\texttt{Q8\_0}/\texttt{Q8\_1}
+tensor payloads directly for native execution experiments. K/IQ/TQ/NV/MX
+families are delegated to the optional upstream \texttt{gguf} reference package
+when it exposes a dequantizer. \\
+StableHLO text & Experimental subset & Parses textual StableHLO arithmetic,
+shape, broadcast, slice, reduce, and cast operations and maps them into CacheIR
+nodes for importer experiments. \\
 \bottomrule
 \end{longtable}
 
@@ -347,8 +358,17 @@ maintains page metadata:
   \item token offsets and page lengths
 \end{itemize}
 
-This gives the compiler and runtime a stable policy contract that future CUDA
+This gives the compiler and runtime a stable policy contract that Triton and CUDA
 kernels can consume.
+
+\subsection{Calibrated Spillover Cost Model}
+
+The spillover policy can be driven by a \texttt{SpilloverCostModel}. It records
+page bytes, free GPU memory, safety margin, PCIe bandwidth, CPU/GPU bandwidth
+estimates, and transfer latencies. From those inputs it computes a resident-page
+budget and annotates spilled pages with target and estimated transfer cost. This
+keeps low-VRAM experiments deterministic in tests while still allowing hardware
+profiles or measured bandwidths to tighten the policy on real machines.
 
 \subsection{Runtime Flow}
 
@@ -388,26 +408,60 @@ This backend is designed for correctness, compiler validation, artifact testing,
 and benchmark regression tracking. It is not presented as a high-performance LLM
 serving backend.
 
-\subsection{C++ Backend Skeleton}
+\subsection{C++ Backend and pybind11 Bridge}
 
-The \texttt{cpp/} directory contains a C++20/OpenMP static library skeleton with
-kernels for RMSNorm, SiLU, and out-by-in matmul. It builds with CMake and Ninja:
+The \texttt{cpp/} directory contains a C++20/OpenMP backend with kernels for
+RMSNorm, SiLU, and out-by-in matmul. The matmul and RMSNorm paths use a runtime
+dot-product dispatcher with scalar, AVX2/FMA, and AVX512 implementations where
+the compiler and host CPU support them. The static library builds with CMake and
+Ninja:
 
 \begin{lstlisting}
 cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=Release
 cmake --build cpp/build --config Release
 \end{lstlisting}
 
-Future work should connect this backend to Python through pybind11 and then
-replace selected NumPy kernels with native implementations.
+The optional pybind11 module exposes native RMSNorm, out-by-in matmul, and SIMD
+capability reporting to Python:
+
+\begin{lstlisting}
+python -m pip install -e ".[native]"
+cmake -S cpp -B cpp/build -DCACHEIR_BUILD_PYTHON=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build cpp/build --config Release
+\end{lstlisting}
+
+On Windows, pinning \texttt{Python3\_EXECUTABLE} to the active interpreter avoids
+CMake choosing another Python installation. The latest local run installed
+\texttt{pybind11} from PyPI and built \texttt{\_cacheir\_native} successfully.
 
 \subsection{GPU and Triton Target Surface}
 
 The compiler can target \texttt{cuda} or \texttt{triton} for kernel naming and
-schedule generation. The project includes Triton target metadata but does not yet
-ship executable Triton kernels. Planned GPU work includes fused RMSNorm/QKV/RoPE,
-decode attention, prefill attention, int4 Tensor Core matmul, and CUDA graph
-capture for decode loops.
+schedule generation. The project includes guarded Triton kernels for RMSNorm and
+SiLU/SwiGLU activation multiply, fused RMSNorm/QKV/RoPE projection,
+single-query decode attention, and multi-batch page-table decode attention with
+GQA mapping when the optional \texttt{triton} package and a CUDA-capable
+environment are available. It also includes a guarded Triton FP16 matmul kernel
+that lowers through \texttt{tl.dot}. The \texttt{cpp/} tree includes CUDA C++
+fused kernels for RMSNorm, SwiGLU, RMSNorm/QKV/RoPE, FP16 WMMA Tensor Core
+matmul, a batched paged-attention ABI, a reduced block-level paged-attention
+decode path, and CUDA graph capture planning.
+
+\subsection{Accelerator Adapter Probes}
+
+CacheIR includes guarded adapter probes and direct wrappers for CUTLASS,
+FlashAttention, and FlashInfer. These adapters do not replace the compiler pipeline: CacheIR still
+owns IR, memory planning, schedules, and dispatch decisions. When an optional
+package is importable, a compatible scheduled op can be routed to that external
+library for experiments and benchmark comparison. CacheIR exposes guarded direct
+wrappers for FlashAttention prefill, FlashInfer single decode, and FlashInfer
+batch paged decode wrapper classes. On the current Windows verification machine,
+\texttt{nvidia-cutlass 4.2.0.0} installs and is detected through
+\texttt{cutlass\_cppgen}. Native Windows/Python 3.13 still lacks a complete
+wheel set for vLLM, FlashAttention, FlashInfer, and llama-cpp-python, so the
+CUDA validation path uses WSL2 environments. Those environments executed real
+FlashAttention prefill and FlashInfer decode smoke paths through CacheIR's
+adapter wrappers.
 
 \section{Quantization}
 
@@ -474,6 +528,8 @@ CacheIR exposes the following commands:
 \texttt{inspect} & Print optimized IR or a specific pass diff. \\
 \texttt{export} & Export IR as HTML, DOT, or text. \\
 \texttt{benchmark} & Measure prefill and decode performance separately. \\
+\texttt{external} & Probe optional upstream systems and run installed IREE/TVM
+smoke benchmarks. \\
 \texttt{run} & Run greedy local generation. \\
 \texttt{serve} & Start an OpenAI-compatible local server. \\
 \bottomrule
@@ -486,6 +542,7 @@ cacheir make-tiny examples/tiny_model
 cacheir compile examples/tiny_model --output examples/tiny_artifact
 cacheir inspect examples/tiny_artifact --mode decode
 cacheir benchmark examples/tiny_artifact --decode-tokens 32 --repeats 3
+cacheir external --benchmark --workdir .tmp/upstream
 cacheir export examples/tiny_artifact examples/decode.html --mode decode
 cacheir run examples/tiny_artifact --prompt "CacheIR"
 \end{lstlisting}
@@ -566,6 +623,69 @@ python scripts/benchmark_matrix.py \
   --decode-tokens 16
 \end{lstlisting}
 
+\subsection{Installed Upstream Benchmarks}
+
+When the optional upstream packages are installed, CacheIR can compile and run
+small real upstream benchmark probes without user-supplied commands:
+
+\begin{lstlisting}
+cacheir external --benchmark --workdir .tmp/upstream
+
+python scripts/compare_external_benchmarks.py examples/tiny_artifact \
+  --run-installed-smoke \
+  --output benchmark_comparison.json
+\end{lstlisting}
+
+The IREE path compiles StableHLO text to a VM flatbuffer through
+\texttt{iree-base-compiler} and runs \texttt{iree-benchmark-module}. The TVM
+path builds and runs a TE/TIR vector-add module through the installed
+\texttt{apache-tvm} wheel. When model artifacts are available, CacheIR can also
+launch model-aware vLLM and llama.cpp helpers:
+
+\begin{lstlisting}
+cacheir external --benchmark --workdir .tmp/upstream \
+  --vllm-model /path/to/hf_model \
+  --llama-model /path/to/model.gguf
+\end{lstlisting}
+
+These helpers run the installed upstream tools rather than wrapping them inside
+CacheIR's runtime. The vLLM helper drives \texttt{vllm bench latency}; the
+llama.cpp helper drives \texttt{llama-bench}.
+
+\subsection{Local Native Experiment Snapshot}
+
+The latest local verification on 2026-06-24 installed the full optional project
+stack with \texttt{python -m pip install -e ".[dev,server,importers,benchmark,native,gpu]"}.
+That installed PyPI \texttt{pybind11}, \texttt{triton-windows}, ONNX/importer
+dependencies, server dependencies, and benchmark dependencies. MSVC Build Tools
+2022 were installed at \texttt{C:\textbackslash BuildTools}, and \texttt{cl.exe}
+was added to the user PATH.
+
+The native smoke test reported \texttt{simd\_backend() == "avx512"} and matched
+NumPy RMSNorm and matmul within float32 tolerance. CUDA Torch
+\texttt{2.12.1+cu130} was installed and CUDA was available on the RTX 5070
+Laptop GPU. The CUDA C++ target built with MSVC/NVCC, producing
+\texttt{cacheir\_cuda\_kernels.lib}. CUDA FP16 WMMA Tensor Core matmul and the
+reduced CUDA paged-attention path also built with MSVC/NVCC. Triton GPU kernels
+executed on CUDA and matched Torch references for RMSNorm, SwiGLU, FP16 matmul,
+single-query decode attention, and multi-batch page-table decode attention. The
+CUTLASS adapter probe detects the installed \texttt{cutlass\_cppgen} module.
+\texttt{iree-base-compiler 3.11.0}, \texttt{iree-base-runtime 3.11.0}, and
+\texttt{apache-tvm 0.25.0} installed from PyPI. The upstream benchmark command
+compiled a StableHLO add module through IREE to a 9,781-byte VMFB and ran
+\texttt{iree-benchmark-module}; TVM built and ran a TE vector-add benchmark with
+checksum 512.0. A calibrated profile run measured CPU copy at 8.05 GB/s and CUDA
+host-to-device transfer at 2.85 GB/s for a 1 MiB sample on this host. The
+WSL2 CUDA environments validated direct FlashAttention prefill and FlashInfer
+decode execution through CacheIR's adapter wrappers. A CUDA llama.cpp build ran
+a real \texttt{llama-bench} model benchmark against a locally converted GGUF
+tiny Llama model. The vLLM helper launched against the same tiny HF model, but
+the local WSL vLLM 0.23.0 CUDA worker failed during initialization with
+\texttt{RuntimeError: UVA is not available}; the failure metadata is captured
+for reproducibility. The benchmark matrix ran 18 rows covering three tiny model
+sizes, fp32 and simulated int4 variants, three prompt lengths, three repeats,
+and 16 decode tokens.
+
 \section{Testing and Validation}
 
 The test suite covers:
@@ -583,6 +703,10 @@ The test suite covers:
   \item benchmark execution
   \item hardware profile serialization
   \item quantized lowering and runtime compatibility
+  \item GGUF dense and \texttt{Q4\_0}/\texttt{Q4\_1}/\texttt{Q5\_0}/\texttt{Q5\_1}/\texttt{Q8\_0}/\texttt{Q8\_1} tensor reads
+  \item StableHLO import with reduce-region metadata and MLIR-style dialect export/parser/verifier round trip
+  \item calibrated spillover cost model and adapter probe behavior
+  \item native pybind11 RMSNorm and matmul parity when the extension is built
 \end{itemize}
 
 Recommended validation commands:
@@ -604,25 +728,36 @@ Primary languages & Python 3.10+, C++20. \\
 Numerical runtime & NumPy reference kernels. \\
 Compiler IR & Custom CacheIR graph IR with JSON and textual representations. \\
 Model import & Hugging Face config conventions, NPZ, safetensors optional,
-ONNX optional, GGUF metadata parser subset. \\
+ONNX optional, GGUF metadata plus dense \texttt{F32}/\texttt{F16}/\texttt{BF16}/\texttt{I8}/\texttt{I16}/\texttt{I32}/\texttt{I64}/\texttt{F64} and
+\texttt{Q4\_0}/\texttt{Q4\_1}/\texttt{Q5\_0}/\texttt{Q5\_1}/\texttt{Q8\_0}/\texttt{Q8\_1} tensor subset, StableHLO textual subset. \\
 Transformer semantics & Llama/Mistral/Qwen-style decoder-only blocks,
 RMSNorm, RoPE, grouped-query attention, SwiGLU, KV cache. \\
 Optimization passes & Shape inference, constant folding, operator fusion,
 layout conversion, dead node elimination, mode specialization, quantization-aware
 lowering, schedule and memory planning. \\
-CPU backend & NumPy today, C++20/OpenMP skeleton for native kernels. \\
-GPU backend surface & CUDA/Triton target naming and kernel metadata; executable
-Triton/CUDA kernels planned. \\
+CPU backend & NumPy reference runtime, C++20/OpenMP native library, scalar,
+AVX2/FMA, and AVX512 dispatch, optional pybind11 bridge, runtime native dispatch. \\
+GPU backend surface & CUDA/Triton target naming, schedule metadata, guarded
+Triton RMSNorm, SiLU/SwiGLU, FP16 matmul, fused RMSNorm/QKV/RoPE, single-query decode
+attention, and multi-batch page-table decode-attention kernels, optional CUDA
+C++ fused kernels, FP16 WMMA Tensor Core matmul, reduced paged-attention decode,
+batched paged-attention ABI, and CUDA graph planning. \\
+Accelerator adapters & Optional CUTLASS, FlashAttention, and FlashInfer probes,
+dispatch contracts, and guarded direct wrappers. \\
 Quantization & int4/int8-style lowering and CPU-side quantize/dequantize
 simulation. \\
 Serving & FastAPI and Uvicorn optional dependencies. \\
 Testing & pytest, compileall, CMake build checks. \\
-Benchmarking & CacheIR benchmark CLI and benchmark matrix script. \\
-Visualization & HTML, DOT, and text IR export. \\
+Benchmarking & CacheIR benchmark CLI, benchmark matrix script, and comparison
+harness for vLLM, llama.cpp, IREE, and TVM commands plus installed IREE/TVM
+smoke benchmark execution and model-aware vLLM/llama.cpp helpers. \\
+Visualization & HTML, DOT, text IR, and MLIR-style CacheIR dialect export plus
+parser/verifier round trip. \\
 Build and packaging & pyproject.toml, setuptools, CMake, Ninja, Docker,
 GitHub Actions. \\
-Future integrations & pybind11, AVX2/AVX512, CUTLASS, FlashAttention/FlashInfer,
-StableHLO, MLIR, IREE, TVM comparison. \\
+External context & vLLM, llama.cpp, IREE, TVM, StableHLO, MLIR, CUTLASS,
+FlashAttention, and FlashInfer are comparison or optional integration surfaces,
+not default runtime dependencies. \\
 \bottomrule
 \end{longtable}
 
@@ -634,25 +769,48 @@ StableHLO, MLIR, IREE, TVM comparison. \\
   \item CPU reference execution without PyTorch.
   \item Prefill and decode graph specialization.
   \item Paged KV-cache reference behavior.
+  \item Prefix-cache reuse and calibrated spillover policy experiments.
   \item Artifact bundles, pass diffs, graph export, benchmarks, and server
         entrypoint.
   \item Quantization-aware lowering with CPU-side quantize/dequantize simulation.
-  \item C++20 backend library build.
+  \item C++20 backend library build with scalar, AVX2/FMA, and AVX512 dispatch.
+  \item Optional pybind11 bridge for native RMSNorm and matmul kernels, with
+        runtime dispatch when \texttt{\_cacheir\_native} is importable.
+  \item Guarded Triton RMSNorm, SiLU/SwiGLU, fused RMSNorm/QKV/RoPE,
+        single-query decode attention, and multi-batch page-table decode
+        attention kernels.
+  \item Guarded Triton FP16 matmul using \texttt{tl.dot} Tensor Core lowering
+        where available.
+  \item Optional CUDA C++ fused kernels for RMSNorm, SwiGLU, RMSNorm/QKV/RoPE,
+        FP16 WMMA Tensor Core matmul, batched paged-attention ABI, and reduced
+        paged-attention decode.
+  \item CUDA graph capture planning for decode replay loops.
+  \item Native GGUF dense numeric tensor reads plus classic Q4/Q5/Q8 block
+        tensor reads.
+  \item Reference GGUF dequantization for upstream-supported K/IQ/TQ/NV/MX formats.
+  \item StableHLO text importer with reduce-region metadata.
+  \item MLIR-style CacheIR dialect emitter, parser, verifier, and optional
+        upstream MLIR C++ dialect registration skeleton.
+  \item CUTLASS, FlashAttention, and FlashInfer adapter probes plus guarded
+        direct wrappers for prefill, single decode, and batch paged decode.
+  \item Direct FlashAttention and FlashInfer smoke execution on WSL2 CUDA
+        environments with compatible wheels.
+  \item Calibrated low-VRAM CPU/GPU spillover cost model with measured bandwidth calibration.
+  \item IREE StableHLO compile/runtime benchmark integration through upstream
+        IREE wheels.
+  \item TVM TE/TIR runtime benchmark integration through the upstream TVM wheel.
+  \item Benchmark comparison harness for vLLM, llama.cpp, IREE, and TVM commands,
+        including installed IREE/TVM smoke runs and model-aware vLLM/llama.cpp
+        helpers.
 \end{itemize}
 
-\subsection{Planned}
+\subsection{Remaining Environment Caveat}
 
-\begin{itemize}[leftmargin=*]
-  \item pybind11 bridge for C++ CPU kernels.
-  \item AVX2 and AVX512 optimized kernels.
-  \item Triton/CUDA fused kernels.
-  \item Native GGUF tensor execution.
-  \item Prefix-cache reuse and spillover policy experiments.
-  \item StableHLO importer experiments.
-  \item MLIR dialect experiments.
-  \item Benchmark comparison against vLLM, llama.cpp, IREE, and TVM where
-        appropriate.
-\end{itemize}
+No active in-repository milestone remains open. The remaining caveat is specific
+to this host: vLLM is installed in WSL2 and the real model benchmark helper
+launches, but the local CUDA worker fails before inference with
+\texttt{RuntimeError: UVA is not available}. The failed benchmark metadata is
+kept as a reproducibility artifact rather than hidden.
 
 \section{Building PDF or ODF Outputs}
 
@@ -676,8 +834,11 @@ pandoc docs/latex/cacheir_project_documentation.tex \
 
 CacheIR is a compact but complete transformer inference compiler project. It
 prioritizes clarity, pass-level explainability, prefill/decode specialization,
-and KV-cache-aware runtime behavior. The current NumPy CPU backend establishes a
-correct reference path, while the artifact format, schedules, C++ skeleton, and
-Triton target surface provide a foundation for future native performance work.
+and KV-cache-aware runtime behavior. The NumPy CPU backend establishes a correct
+reference path, while the artifact format, schedules, C++ AVX backend, optional
+pybind11 bridge, GGUF/StableHLO/MLIR experiments, guarded Triton kernels,
+CUDA fused-kernel sources, accelerator adapter probes, and calibrated spillover
+model, IREE StableHLO bridge, and TVM benchmark bridge provide concrete native
+performance and upstream comparison surfaces.
 
 \end{document}

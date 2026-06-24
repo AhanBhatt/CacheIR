@@ -5,8 +5,9 @@ import json
 from pathlib import Path
 
 from cacheir.benchmark import run_benchmark, save_benchmark
+from cacheir.backends.upstream import probe_external_systems, run_installed_upstream_benchmarks
 from cacheir.compiler import compile_model
-from cacheir.hardware import profile_hardware
+from cacheir.hardware import calibrate_bandwidth, profile_hardware
 from cacheir.importers.tiny import create_tiny_model
 from cacheir.runtime import Runtime
 from cacheir.runtime.artifact import CompileArtifact
@@ -64,7 +65,22 @@ def _export(args: argparse.Namespace) -> None:
 
 
 def _profile(args: argparse.Namespace) -> None:
-    print(json.dumps(profile_hardware().to_dict(), indent=2))
+    data = profile_hardware().to_dict()
+    if args.calibrate:
+        data["bandwidth_calibration"] = calibrate_bandwidth(sample_mb=args.sample_mb, repeats=args.repeats).to_dict()
+    print(json.dumps(data, indent=2))
+
+
+def _external(args: argparse.Namespace) -> None:
+    if args.benchmark:
+        data = run_installed_upstream_benchmarks(args.workdir, vllm_model=args.vllm_model, llama_model=args.llama_model)
+    else:
+        data = {name: status.to_dict() for name, status in probe_external_systems().items()}
+    text = json.dumps(data, indent=2)
+    if args.output:
+        Path(args.output).write_text(text, encoding="utf-8")
+        print(f"wrote {args.output}")
+    print(text)
 
 
 def _make_tiny(args: argparse.Namespace) -> None:
@@ -124,11 +140,22 @@ def build_parser() -> argparse.ArgumentParser:
     export_cmd.add_argument("artifact")
     export_cmd.add_argument("output")
     export_cmd.add_argument("--mode", default="decode", choices=["prefill", "decode"])
-    export_cmd.add_argument("--format", default=None, choices=["html", "dot", "cir", "txt", None])
+    export_cmd.add_argument("--format", default=None, choices=["html", "dot", "cir", "txt", "mlir", None])
     export_cmd.set_defaults(func=_export)
 
     profile_cmd = sub.add_parser("profile", help="print the local hardware profile")
+    profile_cmd.add_argument("--calibrate", action="store_true", help="measure CPU and CUDA transfer bandwidth")
+    profile_cmd.add_argument("--sample-mb", type=int, default=16)
+    profile_cmd.add_argument("--repeats", type=int, default=5)
     profile_cmd.set_defaults(func=_profile)
+
+    external_cmd = sub.add_parser("external", help="probe optional upstream systems and run installed smoke benchmarks")
+    external_cmd.add_argument("--benchmark", action="store_true", help="run real IREE/TVM smoke benchmarks when installed")
+    external_cmd.add_argument("--vllm-model", default=None, help="run vLLM latency benchmark against this HF/local model when installed")
+    external_cmd.add_argument("--llama-model", default=None, help="run llama.cpp llama-bench against this GGUF file when installed")
+    external_cmd.add_argument("--workdir", default=".tmp/upstream", help="scratch directory for compiled upstream artifacts")
+    external_cmd.add_argument("--output", default=None)
+    external_cmd.set_defaults(func=_external)
 
     serve_cmd = sub.add_parser("serve", help="start an OpenAI-compatible local server")
     serve_cmd.add_argument("artifact")

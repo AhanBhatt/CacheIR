@@ -7,6 +7,7 @@ from typing import Iterable
 from cacheir.importers.gguf import import_gguf_metadata
 from cacheir.importers.hf import ModelConfig, build_decoder_graph, import_hf_decoder
 from cacheir.importers.onnx import import_onnx_graph
+from cacheir.importers.stablehlo import import_stablehlo_text
 from cacheir.hardware import profile_hardware
 from cacheir.passes import (
     CompilerContext,
@@ -67,10 +68,15 @@ def _import_model(model_path: str | Path) -> tuple[ModelConfig, object]:
     suffix = path.suffix.lower()
     if suffix == ".onnx":
         return import_onnx_graph(path)
+    if suffix in {".stablehlo", ".mhlo"}:
+        return import_stablehlo_text(path)
     if suffix == ".gguf":
         metadata = import_gguf_metadata(path)
         config = _config_from_gguf(metadata)
-        weight_shapes = {tensor["name"]: tuple(int(dim) for dim in tensor["shape"]) for tensor in metadata.get("tensors", [])}  # type: ignore[index]
+        weight_shapes = {
+            tensor["name"]: _gguf_logical_shape(tuple(int(dim) for dim in tensor["shape"]))
+            for tensor in metadata.get("tensors", [])  # type: ignore[index]
+        }
         key_map = _gguf_key_map(config)
         return config, build_decoder_graph(config, weight_shapes=weight_shapes, weight_files={}, weight_key_map=key_map)
     return import_hf_decoder(path)
@@ -99,6 +105,10 @@ def _gguf_key_map(config: ModelConfig) -> dict[str, str]:
             }
         )
     return mapping
+
+
+def _gguf_logical_shape(shape: tuple[int, ...]) -> tuple[int, ...]:
+    return tuple(reversed(shape)) if len(shape) > 1 else shape
 
 
 def _pipeline() -> PassManager:

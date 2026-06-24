@@ -112,7 +112,7 @@ def _markdown(rows: list[dict[str, object]]) -> str:
             )
         )
     lines.append("")
-    lines.append("Generated with `scripts/benchmark_matrix.py` against the NumPy CPU reference backend.")
+    lines.append("Generated with `scripts/benchmark_matrix.py` against the active CacheIR CPU runtime; native C++ kernels are used when `_cacheir_native` is available.")
     return "\n".join(lines)
 
 

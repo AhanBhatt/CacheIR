@@ -4,7 +4,10 @@ import os
 import platform
 import shutil
 import subprocess
+import time
 from dataclasses import asdict, dataclass
+
+import numpy as np
 
 
 @dataclass
@@ -42,6 +45,17 @@ class HardwareProfile:
         }
 
 
+@dataclass
+class BandwidthCalibration:
+    cpu_copy_gbps: float
+    cuda_h2d_gbps: float | None
+    sample_mb: int
+    repeats: int
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
 def profile_hardware() -> HardwareProfile:
     return HardwareProfile(
         system=platform.system(),
@@ -51,6 +65,50 @@ def profile_hardware() -> HardwareProfile:
         memory_total_mb=_memory_total_mb(),
         gpus=_nvidia_gpus(),
     )
+
+
+def calibrate_bandwidth(*, sample_mb: int = 16, repeats: int = 5, include_cuda: bool = True) -> BandwidthCalibration:
+    sample_mb = max(1, int(sample_mb))
+    repeats = max(1, int(repeats))
+    bytes_count = sample_mb * 1024 * 1024
+    source = np.arange(bytes_count, dtype=np.uint8)
+    target = np.empty_like(source)
+    cpu_times = []
+    for _ in range(repeats):
+        start = time.perf_counter()
+        np.copyto(target, source)
+        cpu_times.append(time.perf_counter() - start)
+    cpu_gbps = _gbps(bytes_count, min(cpu_times))
+    cuda_gbps = _cuda_h2d_gbps(bytes_count, repeats) if include_cuda else None
+    return BandwidthCalibration(cpu_copy_gbps=cpu_gbps, cuda_h2d_gbps=cuda_gbps, sample_mb=sample_mb, repeats=repeats)
+
+
+def _gbps(bytes_count: int, seconds: float) -> float:
+    if seconds <= 0:
+        return 0.0
+    return float(bytes_count) / seconds / 1.0e9
+
+
+def _cuda_h2d_gbps(bytes_count: int, repeats: int) -> float | None:
+    try:
+        import torch
+    except Exception:
+        return None
+    if not torch.cuda.is_available():
+        return None
+    try:
+        source = torch.empty(bytes_count, dtype=torch.uint8, device="cpu", pin_memory=True)
+    except Exception:
+        source = torch.empty(bytes_count, dtype=torch.uint8, device="cpu")
+    target = torch.empty(bytes_count, dtype=torch.uint8, device="cuda")
+    torch.cuda.synchronize()
+    times = []
+    for _ in range(repeats):
+        start = time.perf_counter()
+        target.copy_(source, non_blocking=True)
+        torch.cuda.synchronize()
+        times.append(time.perf_counter() - start)
+    return _gbps(bytes_count, min(times))
 
 
 def _memory_total_mb() -> int | None:

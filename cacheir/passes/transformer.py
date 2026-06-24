@@ -421,7 +421,7 @@ class HardwareAdaptivePlanning:
                 node.attrs["cost_class"] = "mixed_attention"
             else:
                 node.attrs.setdefault("cost_class", "elementwise_or_fused")
-        return PassResult(changed, [f"planned hardware hints for {context.target}/{context.mode}"])
+        return PassResult(changed, [f"assigned hardware hints for {context.target}/{context.mode}"])
 
 
 @dataclass
@@ -529,7 +529,7 @@ class MemoryPlanning:
         }
         if graph.attrs.get("memory_plan") != plan:
             graph.attrs["memory_plan"] = plan
-            return PassResult(True, [f"planned {high_watermark} byte activation arena"])
+            return PassResult(True, [f"assigned {high_watermark} byte activation arena"])
         return PassResult(False, [])
 
 
