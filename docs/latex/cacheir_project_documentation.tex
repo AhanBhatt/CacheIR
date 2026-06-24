@@ -1,0 +1,683 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{array}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{longtable}
+\usepackage{xcolor}
+\usepackage{listings}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue,
+  urlcolor=blue,
+  citecolor=blue
+}
+
+\definecolor{cacheirblue}{HTML}{1F4E79}
+\definecolor{codebg}{HTML}{F5F7FA}
+\definecolor{codeframe}{HTML}{D9E2EC}
+
+\lstdefinestyle{cacheircode}{
+  basicstyle=\ttfamily\small,
+  backgroundcolor=\color{codebg},
+  frame=single,
+  rulecolor=\color{codeframe},
+  breaklines=true,
+  columns=fullflexible,
+  keepspaces=true,
+  showstringspaces=false
+}
+
+\lstset{style=cacheircode}
+
+\title{\textbf{CacheIR Project Documentation}\\
+\large A Narrow, Explainable Compiler and Runtime for Transformer Inference}
+\author{CacheIR Contributors}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+CacheIR is a focused machine-learning compiler and runtime for decoder-only
+transformer inference. It imports Llama, Mistral, and Qwen-style model metadata,
+lowers the model into a custom intermediate representation, applies
+transformer-specific optimization passes, specializes prefill and decode graphs,
+plans memory and execution schedules, selects backend kernels, and executes
+inference through an independent reference runtime. The project is intentionally
+not a wrapper around PyTorch and not a clone of vLLM. Its primary design goal is
+to make the complete path from model graph to runtime schedule inspectable,
+testable, and extensible.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+\section{Project Purpose}
+
+General ML compiler frameworks such as TVM, MLIR-based stacks, IREE, and
+StableHLO-oriented pipelines are broad systems designed to support many models
+and many hardware targets. Large language model serving has a narrower and very
+distinct execution profile. Prefill processes an entire prompt and tends to be
+compute heavy. Decode generates one token at a time and tends to be dominated by
+KV-cache traffic, memory bandwidth, batching policy, and attention kernel choice.
+
+CacheIR exists to explore that narrower problem directly. The project focuses on
+five ideas:
+
+\begin{enumerate}[leftmargin=*]
+  \item Treat prefill and decode as separate compiler modes.
+  \item Compile transformer operations and KV-cache policy together.
+  \item Expose each optimization pass as a textual graph diff.
+  \item Emit memory plans, hardware hints, and execution schedules as first-class
+        artifact data.
+  \item Provide a real reference runtime path that does not execute through
+        PyTorch.
+\end{enumerate}
+
+The current implementation is a complete reference project. It includes an
+installable Python package, command-line interface, model importer skeletons,
+CacheIR graph IR, compiler passes, artifact bundles, graph visualization,
+benchmarks, a NumPy CPU runtime, a paged KV-cache reference implementation, an
+OpenAI-compatible local server, a C++20 backend skeleton, Docker support, CI, and
+tests.
+
+\section{High-Level Architecture}
+
+CacheIR is organized into five layers:
+
+\begin{longtable}{p{0.18\linewidth}p{0.76\linewidth}}
+\toprule
+\textbf{Layer} & \textbf{Role} \\
+\midrule
+Model importer & Reads model configuration, tensor metadata, tokenizer metadata,
+rope settings, attention layout, shape information, and quantization hints. \\
+Intermediate representation & Represents the model as CacheIR graph nodes with
+explicit tensor types, weights, attributes, graph modes, layouts, schedules, and
+memory plans. \\
+Optimization passes & Transform the logical graph into optimized, mode-specific
+graphs for prefill and decode. \\
+Kernel backend & Selects CPU or GPU-oriented kernels and records hardware-aware
+execution hints. \\
+Runtime & Loads compiled artifacts, weights, tokenizers, and KV-cache state, then
+executes scheduled graph nodes through backend dispatch. \\
+\bottomrule
+\end{longtable}
+
+\subsection{Repository Layout}
+
+\begin{lstlisting}
+cacheir/
+  ir.py                  CacheIR graph IR
+  compiler.py            importer selection and pass pipeline
+  importers/             HF, ONNX, GGUF, tiny model support
+  passes/                compiler optimization passes
+  runtime/               artifacts, tokenizer, KV cache, CPU runtime, server
+  backends/              backend registry and target metadata
+  benchmark.py           benchmark runner
+  visualize.py           HTML/DOT/IR graph export
+  hardware.py            hardware profile discovery
+  quantization.py        quantization simulation utilities
+cpp/                     C++20/OpenMP backend skeleton
+docs/                    Markdown and LaTeX documentation
+examples/                tiny model compile demo
+scripts/                 benchmark matrix utility
+tests/                   pytest coverage
+\end{lstlisting}
+
+\section{Model Import}
+
+\subsection{Supported Import Paths}
+
+CacheIR currently supports several import paths at different maturity levels:
+
+\begin{longtable}{p{0.24\linewidth}p{0.18\linewidth}p{0.50\linewidth}}
+\toprule
+\textbf{Format} & \textbf{Status} & \textbf{Details} \\
+\midrule
+Hugging Face directory & Reference path & Reads \texttt{config.json}, discovers
+NPZ or safetensors tensor shapes, and builds a Llama/Mistral/Qwen-style decoder
+graph. \\
+NPZ tiny model & Reference test path & Used by \texttt{cacheir make-tiny}, tests,
+examples, and benchmarks. \\
+safetensors & Metadata/runtime path & Shape discovery and runtime tensor loading
+are supported when the optional \texttt{safetensors} dependency is installed. \\
+ONNX & Generic graph skeleton & Imports generic ONNX nodes into CacheIR ops where
+straightforward. Full transformer semantic recovery is not claimed. \\
+GGUF & Metadata subset & Parses GGUF header metadata and tensor directory, maps
+common Llama tensor names, and builds a CacheIR graph. Native GGUF tensor execution
+is planned. \\
+\bottomrule
+\end{longtable}
+
+\subsection{Model Configuration}
+
+The central importer data structure is \texttt{ModelConfig}. It records:
+
+\begin{itemize}[leftmargin=*]
+  \item architecture name
+  \item hidden size
+  \item intermediate MLP size
+  \item number of layers
+  \item number of attention heads
+  \item number of key/value heads
+  \item vocabulary size
+  \item maximum position embeddings
+  \item RoPE theta
+  \item RMSNorm epsilon
+  \item dtype
+  \item tied embedding policy
+  \item quantization hints
+\end{itemize}
+
+This configuration is used to construct a logical decoder graph. For each layer,
+the importer emits attention norm, Q/K/V projections, RoPE, grouped-query
+attention, output projection, residual adds, MLP norm, gate/up projections, SiLU,
+elementwise multiplication, down projection, and final normalization/head nodes.
+
+\section{Intermediate Representation}
+
+\subsection{Design Goals}
+
+CacheIR's IR is intentionally small and text-friendly. It is not trying to be a
+general replacement for MLIR, StableHLO, or TVM Relay. Instead, it represents the
+subset of operations needed to compile and run decoder-only transformer inference
+while preserving enough metadata for scheduling, memory planning, and pass-level
+explainability.
+
+\subsection{Core Data Types}
+
+\begin{longtable}{p{0.24\linewidth}p{0.68\linewidth}}
+\toprule
+\textbf{Type} & \textbf{Purpose} \\
+\midrule
+\texttt{TensorType} & Shape, dtype, layout, byte-size estimation, and symbolic
+dimension handling. \\
+\texttt{WeightSpec} & Maps an IR value to a named tensor key, tensor type,
+optional quantization metadata, and optional backing file. \\
+\texttt{Node} & Operation, inputs, outputs, attributes, name, and side-effect
+flag. \\
+\texttt{Graph} & Complete IR graph with inputs, outputs, nodes, values, weights,
+constants, graph attributes, mode, and target. \\
+\texttt{CompileArtifact} & Serializable package containing graphs, pass traces,
+model config, target, quantization, and metadata. \\
+\bottomrule
+\end{longtable}
+
+\subsection{Important IR Operations}
+
+\begin{longtable}{p{0.30\linewidth}p{0.62\linewidth}}
+\toprule
+\textbf{Operation} & \textbf{Meaning} \\
+\midrule
+\texttt{token\_embedding} & Gathers hidden vectors from token IDs and embedding
+weights. \\
+\texttt{rms\_norm} & RMS normalization with learned scale. \\
+\texttt{matmul} & Linear projection using out-by-in weight layout. \\
+\texttt{qkv\_projection} & Fused logical Q/K/V projection produced by compiler
+passes. \\
+\texttt{rope} & Rotary position embedding applied to Q and K. \\
+\texttt{grouped\_query\_attention} & Logical GQA/MQA attention before mode
+specialization. \\
+\texttt{paged\_attention\_prefill} & Prefill-specialized attention op. \\
+\texttt{paged\_attention\_decode} & Decode-specialized attention op. \\
+\texttt{fused\_rmsnorm\_qkv\_rope} & Fused norm, Q/K/V projection, and RoPE op. \\
+\texttt{fused\_swiglu} & Fused gate projection, up projection, SiLU, and multiply. \\
+\texttt{quantized\_matmul} & Quantization-aware matmul lowering. \\
+\bottomrule
+\end{longtable}
+
+\subsection{Example IR}
+
+Logical attention begins as separate nodes:
+
+\begin{lstlisting}
+%attn_norm = rms_norm(%hidden, %attn_norm_w)
+%q = matmul(%attn_norm, %q_proj_w)
+%k = matmul(%attn_norm, %k_proj_w)
+%v = matmul(%attn_norm, %v_proj_w)
+%q_rope, %k_rope = rope(%q, %k)
+%attn = grouped_query_attention(%q_rope, %k_rope, %v)
+\end{lstlisting}
+
+After fusion and decode specialization, the graph contains fewer scheduled calls:
+
+\begin{lstlisting}
+%q_rope, %k_rope, %v = fused_rmsnorm_qkv_rope(...)
+%attn = paged_attention_decode(%q_rope, %k_rope, %v)
+\end{lstlisting}
+
+\section{Compiler Pipeline}
+
+\subsection{Pass Manager}
+
+The pass manager applies a fixed transformer-oriented pipeline to each requested
+execution mode. A compile call can request both \texttt{prefill} and
+\texttt{decode}; each mode receives a cloned graph and its own pass trace.
+
+\subsection{Passes}
+
+\begin{longtable}{p{0.28\linewidth}p{0.64\linewidth}}
+\toprule
+\textbf{Pass} & \textbf{Effect} \\
+\midrule
+Shape inference & Infers tensor types for values produced by each op. \\
+Constant folding & Evaluates small constant arithmetic and activation nodes. \\
+QKV projection fusion & Replaces separate Q, K, and V matmuls with one logical
+\texttt{qkv\_projection}. \\
+RMSNorm/QKV/RoPE fusion & Fuses RMSNorm, QKV projection, and RoPE into
+\texttt{fused\_rmsnorm\_qkv\_rope}. \\
+SwiGLU fusion & Fuses gate/up projection, SiLU, and elementwise multiply into
+\texttt{fused\_swiglu}. \\
+Prefill/decode specialization & Replaces logical attention with
+\texttt{paged\_attention\_prefill} or \texttt{paged\_attention\_decode}. \\
+Layout conversion & Selects CPU or GPU-oriented activation and weight layouts. \\
+Quantization-aware lowering & Rewrites matmul-family ops to quantized variants
+when a quantization mode is requested. \\
+Dead node elimination & Removes values that no longer contribute to graph
+outputs. \\
+Hardware-adaptive planning & Records page sizes, low-VRAM hints, and cost-class
+metadata based on local hardware profile and target. \\
+Kernel selection & Assigns backend kernel names to graph nodes. \\
+Execution planning & Emits a schedule with step number, op, kernel, inputs,
+outputs, estimated bytes, and estimated FLOPs. \\
+Static memory planning & Computes a reusable activation arena with offsets,
+sizes, and value lifetimes. \\
+\bottomrule
+\end{longtable}
+
+\subsection{Pass Trace and Explainability}
+
+Every pass records:
+
+\begin{itemize}[leftmargin=*]
+  \item pass name
+  \item whether the graph changed
+  \item remarks
+  \item full before text
+  \item full after text
+  \item unified diff
+\end{itemize}
+
+This makes the compiler inspectable from the command line:
+
+\begin{lstlisting}
+cacheir inspect examples/tiny_artifact \
+  --mode decode \
+  --pass-name prefill_decode_specialization
+\end{lstlisting}
+
+\section{Prefill and Decode Specialization}
+
+Prefill and decode are not treated as one static graph. CacheIR compiles separate
+graphs because the phases stress different resources.
+
+\subsection{Prefill}
+
+Prefill consumes the prompt sequence. It uses causal masking across the prompt and
+is relatively compute heavy. The prefill graph records
+\texttt{paged\_attention\_prefill} nodes and a memory plan sized for prompt-length
+activations.
+
+\subsection{Decode}
+
+Decode usually consumes one token per step. It appends keys and values to the
+KV-cache and repeatedly attends over the cache. The decode graph records
+\texttt{paged\_attention\_decode} nodes, smaller activation memory requirements,
+decode-oriented page-size hints, and cost-class labels such as
+\texttt{kv\_bandwidth\_bound}.
+
+\section{KV-Cache-Aware Runtime}
+
+\subsection{Paged KV Cache}
+
+The runtime includes a \texttt{PagedKVCache}. The reference CPU implementation
+stores keys and values in contiguous NumPy arrays for simplicity, but it also
+maintains page metadata:
+
+\begin{itemize}[leftmargin=*]
+  \item page size
+  \item page IDs
+  \item layer-to-page mapping
+  \item token offsets and page lengths
+\end{itemize}
+
+This gives the compiler and runtime a stable policy contract that future CUDA
+kernels can consume.
+
+\subsection{Runtime Flow}
+
+The runtime performs the following steps:
+
+\begin{enumerate}[leftmargin=*]
+  \item Load a \texttt{CompileArtifact}.
+  \item Create a \texttt{WeightStore}.
+  \item Load tokenizer metadata through \texttt{TokenizerBridge}.
+  \item Allocate a \texttt{PagedKVCache}.
+  \item Convert input text to token IDs.
+  \item Execute the prefill graph.
+  \item Repeatedly execute the decode graph for greedy generation.
+\end{enumerate}
+
+\section{Backend Model}
+
+\subsection{CPU Reference Backend}
+
+The current executable backend is a NumPy CPU reference runtime. It implements:
+
+\begin{itemize}[leftmargin=*]
+  \item token embedding
+  \item RMSNorm
+  \item matmul
+  \item fused RMSNorm/QKV/RoPE
+  \item RoPE
+  \item paged attention prefill and decode
+  \item residual add
+  \item SiLU
+  \item elementwise multiply
+  \item fused SwiGLU
+  \item softmax
+\end{itemize}
+
+This backend is designed for correctness, compiler validation, artifact testing,
+and benchmark regression tracking. It is not presented as a high-performance LLM
+serving backend.
+
+\subsection{C++ Backend Skeleton}
+
+The \texttt{cpp/} directory contains a C++20/OpenMP static library skeleton with
+kernels for RMSNorm, SiLU, and out-by-in matmul. It builds with CMake and Ninja:
+
+\begin{lstlisting}
+cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=Release
+cmake --build cpp/build --config Release
+\end{lstlisting}
+
+Future work should connect this backend to Python through pybind11 and then
+replace selected NumPy kernels with native implementations.
+
+\subsection{GPU and Triton Target Surface}
+
+The compiler can target \texttt{cuda} or \texttt{triton} for kernel naming and
+schedule generation. The project includes Triton target metadata but does not yet
+ship executable Triton kernels. Planned GPU work includes fused RMSNorm/QKV/RoPE,
+decode attention, prefill attention, int4 Tensor Core matmul, and CUDA graph
+capture for decode loops.
+
+\section{Quantization}
+
+CacheIR supports quantization-aware lowering. When a compile call requests a
+quantization mode such as \texttt{int4\_awq}, matmul-family ops are rewritten to
+quantized variants:
+
+\begin{itemize}[leftmargin=*]
+  \item \texttt{matmul} becomes \texttt{quantized\_matmul}
+  \item \texttt{fused\_rmsnorm\_qkv\_rope} becomes
+        \texttt{quantized\_fused\_rmsnorm\_qkv\_rope}
+  \item \texttt{fused\_swiglu} becomes \texttt{quantized\_fused\_swiglu}
+\end{itemize}
+
+The CPU reference runtime simulates quantized weights by quantizing and
+dequantizing weights once on load. This validates graph lowering and runtime
+compatibility but is not a compressed high-performance kernel implementation.
+
+\section{Artifacts}
+
+\subsection{Single-File Artifact}
+
+A \texttt{CompileArtifact} can be saved as JSON. It includes:
+
+\begin{itemize}[leftmargin=*]
+  \item artifact version and creation time
+  \item target
+  \item quantization mode
+  \item model path
+  \item model configuration
+  \item graphs by mode
+  \item pass traces by mode
+  \item compiler metadata
+\end{itemize}
+
+\subsection{Bundle Artifact}
+
+When the output path has no file suffix, CacheIR writes a bundle:
+
+\begin{lstlisting}
+artifact.json
+manifest.json
+README.txt
+graphs/prefill.cir
+graphs/decode.cir
+schedules/prefill.json
+schedules/decode.json
+passes/*.diff
+\end{lstlisting}
+
+This makes the compiler output reviewable without writing custom tooling.
+
+\section{Command-Line Interface}
+
+CacheIR exposes the following commands:
+
+\begin{longtable}{p{0.20\linewidth}p{0.70\linewidth}}
+\toprule
+\textbf{Command} & \textbf{Purpose} \\
+\midrule
+\texttt{profile} & Print local CPU/GPU hardware profile. \\
+\texttt{make-tiny} & Generate a small Llama-shaped test model. \\
+\texttt{compile} & Compile a model into a CacheIR artifact. \\
+\texttt{inspect} & Print optimized IR or a specific pass diff. \\
+\texttt{export} & Export IR as HTML, DOT, or text. \\
+\texttt{benchmark} & Measure prefill and decode performance separately. \\
+\texttt{run} & Run greedy local generation. \\
+\texttt{serve} & Start an OpenAI-compatible local server. \\
+\bottomrule
+\end{longtable}
+
+\subsection{Example Session}
+
+\begin{lstlisting}
+cacheir make-tiny examples/tiny_model
+cacheir compile examples/tiny_model --output examples/tiny_artifact
+cacheir inspect examples/tiny_artifact --mode decode
+cacheir benchmark examples/tiny_artifact --decode-tokens 32 --repeats 3
+cacheir export examples/tiny_artifact examples/decode.html --mode decode
+cacheir run examples/tiny_artifact --prompt "CacheIR"
+\end{lstlisting}
+
+\section{Python API}
+
+The public API is intentionally small:
+
+\begin{lstlisting}[language=Python]
+from cacheir import Runtime, compile_model
+
+artifact = compile_model(
+    model_path="examples/tiny_model",
+    target="cpu",
+    quant=None,
+    mode=["prefill", "decode"],
+    max_seq=128,
+)
+
+rt = Runtime(artifact)
+for token in rt.generate("Explain MLIR in simple terms", max_new_tokens=16):
+    print(token, end="")
+\end{lstlisting}
+
+\section{Serving API}
+
+When optional server dependencies are installed, CacheIR can start a FastAPI
+server with OpenAI-compatible endpoints:
+
+\begin{lstlisting}
+cacheir serve examples/tiny_artifact --host 127.0.0.1 --port 8000
+\end{lstlisting}
+
+Supported endpoints include:
+
+\begin{itemize}[leftmargin=*]
+  \item \texttt{GET /v1/models}
+  \item \texttt{POST /v1/completions}
+  \item \texttt{POST /v1/chat/completions}
+\end{itemize}
+
+Streaming chat completions return server-sent events with OpenAI-style JSON
+chunks.
+
+\section{Benchmarking}
+
+\subsection{Single Artifact Benchmark}
+
+\begin{lstlisting}
+cacheir benchmark examples/tiny_artifact \
+  --prompt "CacheIR benchmark" \
+  --decode-tokens 64 \
+  --repeats 5
+\end{lstlisting}
+
+The output reports:
+
+\begin{itemize}[leftmargin=*]
+  \item prompt token count
+  \item decode token count
+  \item average prefill latency
+  \item average decode latency per token
+  \item prefill tokens per second
+  \item decode tokens per second
+  \item KV-cache page statistics
+\end{itemize}
+
+\subsection{Benchmark Matrix}
+
+The repository includes \texttt{scripts/benchmark\_matrix.py}, which generates
+three reference model sizes, compiles fp32 and simulated int4 variants, runs three
+prompt lengths, and emits JSON plus Markdown summaries:
+
+\begin{lstlisting}
+python scripts/benchmark_matrix.py \
+  --output benchmark_results.json \
+  --repeats 3 \
+  --decode-tokens 16
+\end{lstlisting}
+
+\section{Testing and Validation}
+
+The test suite covers:
+
+\begin{itemize}[leftmargin=*]
+  \item decoder graph compilation
+  \item decode specialization
+  \item pass fusion behavior
+  \item artifact JSON round trips
+  \item artifact bundle loading
+  \item graph export
+  \item runtime prefill and decode
+  \item KV-cache growth
+  \item greedy generation
+  \item benchmark execution
+  \item hardware profile serialization
+  \item quantized lowering and runtime compatibility
+\end{itemize}
+
+Recommended validation commands:
+
+\begin{lstlisting}
+python -m pytest -q
+python -m compileall cacheir scripts -q
+cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=Release
+cmake --build cpp/build --config Release
+\end{lstlisting}
+
+\section{Complete Technology Stack}
+
+\begin{longtable}{p{0.26\linewidth}p{0.64\linewidth}}
+\toprule
+\textbf{Area} & \textbf{Technologies} \\
+\midrule
+Primary languages & Python 3.10+, C++20. \\
+Numerical runtime & NumPy reference kernels. \\
+Compiler IR & Custom CacheIR graph IR with JSON and textual representations. \\
+Model import & Hugging Face config conventions, NPZ, safetensors optional,
+ONNX optional, GGUF metadata parser subset. \\
+Transformer semantics & Llama/Mistral/Qwen-style decoder-only blocks,
+RMSNorm, RoPE, grouped-query attention, SwiGLU, KV cache. \\
+Optimization passes & Shape inference, constant folding, operator fusion,
+layout conversion, dead node elimination, mode specialization, quantization-aware
+lowering, schedule and memory planning. \\
+CPU backend & NumPy today, C++20/OpenMP skeleton for native kernels. \\
+GPU backend surface & CUDA/Triton target naming and kernel metadata; executable
+Triton/CUDA kernels planned. \\
+Quantization & int4/int8-style lowering and CPU-side quantize/dequantize
+simulation. \\
+Serving & FastAPI and Uvicorn optional dependencies. \\
+Testing & pytest, compileall, CMake build checks. \\
+Benchmarking & CacheIR benchmark CLI and benchmark matrix script. \\
+Visualization & HTML, DOT, and text IR export. \\
+Build and packaging & pyproject.toml, setuptools, CMake, Ninja, Docker,
+GitHub Actions. \\
+Future integrations & pybind11, AVX2/AVX512, CUTLASS, FlashAttention/FlashInfer,
+StableHLO, MLIR, IREE, TVM comparison. \\
+\bottomrule
+\end{longtable}
+
+\section{Limitations and Roadmap}
+
+\subsection{Implemented and Tested}
+
+\begin{itemize}[leftmargin=*]
+  \item CPU reference execution without PyTorch.
+  \item Prefill and decode graph specialization.
+  \item Paged KV-cache reference behavior.
+  \item Artifact bundles, pass diffs, graph export, benchmarks, and server
+        entrypoint.
+  \item Quantization-aware lowering with CPU-side quantize/dequantize simulation.
+  \item C++20 backend library build.
+\end{itemize}
+
+\subsection{Planned}
+
+\begin{itemize}[leftmargin=*]
+  \item pybind11 bridge for C++ CPU kernels.
+  \item AVX2 and AVX512 optimized kernels.
+  \item Triton/CUDA fused kernels.
+  \item Native GGUF tensor execution.
+  \item Prefix-cache reuse and spillover policy experiments.
+  \item StableHLO importer experiments.
+  \item MLIR dialect experiments.
+  \item Benchmark comparison against vLLM, llama.cpp, IREE, and TVM where
+        appropriate.
+\end{itemize}
+
+\section{Building PDF or ODF Outputs}
+
+The source of this document is intended to be version controlled. Generated
+outputs are intentionally ignored by \texttt{.gitignore}.
+
+To build a PDF with a local LaTeX distribution:
+
+\begin{lstlisting}
+pdflatex -interaction=nonstopmode docs/latex/cacheir_project_documentation.tex
+\end{lstlisting}
+
+To build an OpenDocument text file with Pandoc:
+
+\begin{lstlisting}
+pandoc docs/latex/cacheir_project_documentation.tex \
+  -o docs/latex/cacheir_project_documentation.odt
+\end{lstlisting}
+
+\section{Conclusion}
+
+CacheIR is a compact but complete transformer inference compiler project. It
+prioritizes clarity, pass-level explainability, prefill/decode specialization,
+and KV-cache-aware runtime behavior. The current NumPy CPU backend establishes a
+correct reference path, while the artifact format, schedules, C++ skeleton, and
+Triton target surface provide a foundation for future native performance work.
+
+\end{document}

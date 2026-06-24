@@ -36,6 +36,30 @@ CacheIR focuses on that smaller problem:
 | Tooling | CLI, artifact bundles, graph HTML/DOT export, benchmark runner, hardware profiler |
 | Native backend | C++20/OpenMP skeleton builds; Triton target metadata is present |
 
+## Complete Tech Stack
+
+| Area | Stack |
+| --- | --- |
+| Primary languages | Python 3.10+, C++20 |
+| Python packaging | `pyproject.toml`, setuptools, editable installs, optional dependency groups |
+| Core numerical runtime | NumPy reference kernels |
+| Compiler IR | Custom CacheIR graph IR, JSON artifacts, text IR dumps, pass diffs |
+| Model import | Hugging Face `config.json`, NPZ reference weights, safetensors optional, ONNX optional, GGUF metadata subset |
+| Transformer architecture | Llama/Mistral/Qwen-style decoder-only blocks, RMSNorm, RoPE, grouped-query attention, SwiGLU, residual streams |
+| Compiler passes | Shape inference, constant folding, QKV fusion, RMSNorm+QKV+RoPE fusion, SwiGLU fusion, prefill/decode specialization, layout conversion, quant-aware lowering, DCE, hardware hints, kernel selection, execution scheduling, static memory planning |
+| Runtime systems | Weight loader, tokenizer bridge, paged KV cache, backend dispatcher, greedy streaming decode loop |
+| CPU backend | NumPy executable backend today; C++20/OpenMP static-library skeleton for native kernels |
+| GPU backend surface | CUDA/Triton target naming, kernel metadata, schedule generation; executable Triton/CUDA kernels are planned |
+| Quantization | int4/int8-style graph lowering plus CPU-side quantize/dequantize simulation |
+| Serving | FastAPI and Uvicorn optional dependencies, OpenAI-compatible `/v1/models`, `/v1/completions`, `/v1/chat/completions` |
+| Benchmarks | Built-in benchmark CLI, prefill/decode split metrics, benchmark matrix script |
+| Visualization | HTML export, Graphviz DOT export, text IR export |
+| Native build | CMake, Ninja, OpenMP |
+| Testing | pytest, Python bytecode compilation checks, CLI smoke tests, CMake build checks |
+| Infrastructure | Dockerfile, Makefile, GitHub Actions |
+| Documentation | Markdown docs and full LaTeX project documentation in `docs/latex/` |
+| Future integrations | pybind11, AVX2/AVX512 kernels, CUTLASS, FlashAttention/FlashInfer, StableHLO, MLIR, IREE, TVM comparison |
+
 ## Install
 
 ```bash
@@ -163,6 +187,10 @@ python -m compileall cacheir -q
 cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=Release
 cmake --build cpp/build --config Release
 ```
+
+Full project documentation is available as LaTeX source at
+`docs/latex/cacheir_project_documentation.tex`. Generated PDF/ODF outputs and
+LaTeX build products are ignored by `.gitignore`.
 
 Project layout:
 

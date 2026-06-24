@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Build outputs
+build/
+dist/
+*.egg-info/
+cpp/build/
+
+# CacheIR generated examples and benchmark outputs
+examples/tiny_model/
+examples/tiny_artifact/
+examples/tiny_cacheir_artifact/
+examples/tiny_cacheir_artifact.json
+benchmark_results.json
+benchmark_results.md
+
+# LaTeX / PDF / ODF generated documentation artifacts
+docs/latex/build/
+docs/latex/*.aux
+docs/latex/*.bbl
+docs/latex/*.bcf
+docs/latex/*.blg
+docs/latex/*.fdb_latexmk
+docs/latex/*.fls
+docs/latex/*.idx
+docs/latex/*.ilg
+docs/latex/*.ind
+docs/latex/*.lof
+docs/latex/*.log
+docs/latex/*.lot
+docs/latex/*.out
+docs/latex/*.run.xml
+docs/latex/*.synctex.gz
+docs/latex/*.toc
+docs/latex/*.pdf
+docs/latex/*.odt
+docs/latex/*.fodt
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
