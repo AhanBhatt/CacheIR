@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cacheir"
+version = "0.1.0"
+description = "A narrow, explainable compiler and runtime for transformer inference."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "CacheIR contributors" }]
+dependencies = [
+  "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+importers = ["safetensors>=0.4", "onnx>=1.15", "tokenizers>=0.15"]
+server = ["fastapi>=0.110", "uvicorn>=0.27"]
+benchmark = ["psutil>=5.9"]
+dev = ["pytest>=8"]
+
+[project.urls]
+Homepage = "https://github.com/cacheir/cacheir"
+Documentation = "https://github.com/cacheir/cacheir/tree/main/docs"
+
+[project.scripts]
+cacheir = "cacheir.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["cacheir*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
