@@ -22,12 +22,6 @@ experimental import/export surfaces for GGUF, StableHLO, and MLIR-style CacheIR.
   <img src="assets/readme/cacheir_pipeline.png" alt="CacheIR compiler pipeline from importer to runtime" width="100%">
 </p>
 
-| Dimension | Current score | What it means |
-| --- | ---: | --- |
-| Explainable LLM compiler | 8/10 | Real IR, passes, artifacts, diffs, schedules, and docs |
-| Production serving system | 7/10 | Server, metrics, scheduler, prefix reuse, CUDA runtime, and admission controls exist |
-| Raw performance competitor | 6/10 | CUDA wins on larger toy shapes, but tuned quant GEMM and large-model evidence are still missing |
-
 <p align="center">
   <img src="assets/readme/validation_output.png" alt="CacheIR validation output showing tests, scheduler benchmark, hardware calibration, and upstream checks" width="100%">
 </p>
@@ -400,7 +394,7 @@ scripts/                 benchmark matrix, scheduler, GPU, and upstream helpers
 tests/                   pytest coverage
 ```
 
-## Honest Boundaries
+## Boundaries
 
 Implemented and tested:
 
@@ -443,10 +437,8 @@ CacheIR is now a real, inspectable transformer compiler/runtime project with
 working serving surfaces, scheduler metrics, admission control, native CPU hooks,
 an end-to-end CUDA runtime, scheduler-integrated CUDA batching, shared CUDA page
 allocator accounting, GPU kernel microbenchmarks, and upstream comparison
-harnesses. It is still not honestly an 8/10 production LLM serving system or raw
-performance competitor against vLLM, TensorRT-LLM, llama.cpp, or MLC LLM on real
-model sizes. The missing pieces are a true page-backed shared GPU KV allocator
-used directly by fused attention kernels, packed quantized GEMM, tuned
+harnesses. Remaining engineering work includes a true page-backed shared GPU KV
+allocator used directly by fused attention kernels, packed quantized GEMM, tuned
 cuBLASLt/CUTLASS/Triton matmul selection, robust model coverage, and large-model
 benchmark evidence. Remaining work is tracked in `docs/roadmap.md`.
 

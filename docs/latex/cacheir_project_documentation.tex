@@ -1022,32 +1022,11 @@ not default runtime dependencies. \\
         helpers.
 \end{itemize}
 
-\subsection{Honest Evaluation}
+\subsection{Remaining Production and Performance Work}
 
-CacheIR is a real, inspectable transformer compiler/runtime project, but it is
-not yet a production peer of vLLM, TensorRT-LLM, llama.cpp, or MLC LLM on real
-model sizes. The current honest scorecard is:
-
-\begin{longtable}{p{0.42\linewidth}p{0.12\linewidth}p{0.36\linewidth}}
-\toprule
-\textbf{Dimension} & \textbf{Score} & \textbf{Reason} \\
-\midrule
-Explainable LLM compiler project & 8/10 & Real IR, passes, artifacts, diffs,
-memory plans, imports, tests, and documentation. \\
-Research/portfolio systems project & 8/10 & Broad, runnable, benchmarked, and
-inspectable. \\
-Production LLM serving system & 7/10 & Serving APIs, scheduler, metrics, prefix
-reuse, queue limits, priorities, cancellation, CUDA model runtime, shared page
-accounting, and variable-length CUDA scheduler batching exist; persistent
-page-backed fused attention and reliability hardening are still missing. \\
-Raw performance competitor & 6/10 & CUDA fp16 runtime, Triton kernels, batched
-decode attention smoke execution, and CUDA scheduler batching show measured
-speedups on larger toy shapes, but tuned quantized GEMM and large-model evidence
-are still missing. \\
-\bottomrule
-\end{longtable}
-
-\subsection{Remaining Work Toward an 8/10 Production Score}
+CacheIR is a real, inspectable transformer compiler/runtime project. The
+remaining work is concrete systems work needed for production-grade serving and
+large-model performance:
 
 \begin{itemize}[leftmargin=*]
   \item Persistent page-backed shared GPU KV storage used directly by scheduler

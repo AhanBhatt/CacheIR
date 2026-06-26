@@ -44,7 +44,7 @@ Implemented:
 - repeatable CUDA scheduler benchmark script showing sequential-session versus batched-prefill/decode throughput
 - runnable WSL2 CUDA vLLM comparison with vLLM 0.23.0, Torch 2.11.0+cu130, FlashInfer, CUDA Toolkit 13.3, and a CacheIR-created tiny Llama h128 model
 
-Remaining work for an honest 8/10 production-serving and raw-performance score:
+Remaining production-serving and raw-performance work:
 
 - Persistent page-backed shared GPU KV storage used directly by the scheduler's
   fused decode kernels, beyond the current shared allocator accounting.

@@ -16,7 +16,7 @@ prefill with padding/masking at KV boundaries and active CUDA decode rounds
 across multiple request sessions.
 
 The CPU runtime also gained a native fused SiLU-multiply pybind11 kernel and a
-more honest matmul dispatch policy: NumPy's optimized contraction is the
+conservative matmul dispatch policy: NumPy's optimized contraction is the
 default, while CacheIR's native AVX matmul remains available for experiments
 through `CACHEIR_NATIVE_MATMUL`.
 
@@ -31,10 +31,9 @@ The vLLM CUDA comparison path is runnable again. Two local blockers were fixed:
   CacheIR-launched vLLM benchmarks.
 
 This improves CacheIR substantially as an explainable compiler/runtime project.
-It still does not honestly rate as an 8/10 production LLM serving system or raw
-performance competitor on real model sizes. It still lacks packed quantized
-GEMM, a true page-backed shared GPU paged KV allocator used directly by fused
-attention kernels, tuned GEMM selection, and large-model benchmark evidence.
+The remaining work is concrete systems work: packed quantized GEMM, a true
+page-backed shared GPU paged KV allocator used directly by fused attention
+kernels, tuned GEMM selection, and large-model benchmark evidence.
 
 ## Environment
 
@@ -365,16 +364,9 @@ is not packed int4 inference. The third biggest gap is model scale and coverage:
 the strongest CUDA evidence is still toy-shaped models, not 0.5B/1.5B/7B local
 models.
 
-Honest current evaluation after this pass:
+## Remaining Performance Work
 
-| Dimension | Score | Reason |
-| --- | ---: | --- |
-| Explainable LLM compiler project | 8/10 | Real IR, passes, artifacts, diffs, memory plans, imports, tests, docs |
-| Research/portfolio systems project | 8/10 | Broad, runnable, benchmarked, and inspectable |
-| Production LLM serving system | 7/10 | Serving APIs, scheduler, metrics, prefix reuse, queue limits, priorities, cancellation, CUDA model runtime, shared page accounting, and variable-length CUDA scheduler batching exist; persistent page-backed fused attention and reliability hardening are still missing |
-| Raw performance competitor | 6/10 | CUDA fp16 runtime, Triton kernels, batched decode attention smoke execution, and CUDA scheduler batching show measured speedups on larger toy shapes, but no tuned quantized GEMM or large-model evidence yet |
-
-To reach an honest 8/10 in the last two categories, CacheIR needs an end-to-end
-production CUDA serving loop with persistent page-backed attention, packed
-quantized GEMM, tuned GEMM selection, real model coverage beyond toy shapes, and
-throughput/latency comparisons on 0.5B to 7B-class models.
+CacheIR needs an end-to-end production CUDA serving loop with persistent
+page-backed attention, packed quantized GEMM, tuned GEMM selection, real model
+coverage beyond toy shapes, and throughput/latency comparisons on 0.5B to
+7B-class models.
