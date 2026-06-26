@@ -16,6 +16,22 @@ guarded Triton kernels, optional CUDA fused-kernel sources, optional accelerator
 adapters, CUDA graph capture plans, calibrated KV spillover cost models, and
 experimental import/export surfaces for GGUF, StableHLO, and MLIR-style CacheIR.
 
+## Visual Snapshot
+
+<p align="center">
+  <img src="assets/readme/cacheir_pipeline.png" alt="CacheIR compiler pipeline from importer to runtime" width="100%">
+</p>
+
+| Dimension | Current score | What it means |
+| --- | ---: | --- |
+| Explainable LLM compiler | 8/10 | Real IR, passes, artifacts, diffs, schedules, and docs |
+| Production serving system | 7/10 | Server, metrics, scheduler, prefix reuse, CUDA runtime, and admission controls exist |
+| Raw performance competitor | 6/10 | CUDA wins on larger toy shapes, but tuned quant GEMM and large-model evidence are still missing |
+
+<p align="center">
+  <img src="assets/readme/validation_output.png" alt="CacheIR validation output showing tests, scheduler benchmark, hardware calibration, and upstream checks" width="100%">
+</p>
+
 ## Why CacheIR Exists
 
 Most ML compiler stacks are powerful but broad and opaque. LLM serving has a very
@@ -219,6 +235,25 @@ cacheir serve ARTIFACT_DIR --host 127.0.0.1 --port 8000 --max-batch-size 4 --max
 
 CacheIR reports prefill and decode separately because they stress different parts
 of the system:
+
+<p align="center">
+  <img src="assets/readme/cuda_scheduler_speedup.png" alt="CUDA scheduler benchmark showing sequential versus batched runtime latency" width="100%">
+</p>
+
+| Result | Baseline | CacheIR path | Change |
+| --- | ---: | ---: | ---: |
+| h1024/l4 scheduler latency | 582.177 ms | 339.796 ms | 1.71x faster |
+| h2048/l4 scheduler latency | 867.240 ms | 684.002 ms | 1.27x faster |
+| h1024/l4 runtime prefill | 30.984 ms CPU | 7.533 ms CUDA | 4.11x faster |
+| h2048/l4 runtime prefill | 94.036 ms CPU | 6.705 ms CUDA | 14.02x faster |
+
+<p align="center">
+  <img src="assets/readme/runtime_crossover.png" alt="CacheIR CPU reference versus CUDA runtime prefill and decode latency comparison" width="100%">
+</p>
+
+<p align="center">
+  <img src="assets/readme/gpu_kernel_snapshot.png" alt="CacheIR GPU kernel benchmark snapshot for Triton RMSNorm, SiLU multiply, and FP16 matmul" width="100%">
+</p>
 
 ```bash
 python scripts/benchmark_matrix.py --output benchmark_results.json --repeats 3 --decode-tokens 16

@@ -26,6 +26,9 @@ benchmark_comparison.json
 upstream_benchmarks.json
 *.vmfb
 
+# Project documentation folder requested ignored; tracked docs remain tracked by git.
+docs/
+
 # LaTeX / PDF / ODF generated documentation artifacts
 docs/latex/build/
 docs/latex/*.aux
