@@ -9,12 +9,20 @@ CacheIR has five layers.
 5. The runtime executes the compiled graph and owns tokenizer, KV-cache, and server loops.
 
 The reference execution backend is NumPy CPU. It is intentionally simple so pass
-behavior is easy to validate. Native experiments live beside it: a C++20/OpenMP
+behavior is easy to validate. A CUDA artifact runtime now lives beside it: it
+executes the same lowered graph on GPU tensors with fp16 weights, GPU-resident
+KV state, SDPA attention, guarded Triton elementwise kernels, cached packed
+QKV/Gate-Up weights, and shared CUDA page allocator accounting across forked
+request sessions. The continuous-batch scheduler can use variable-length CUDA
+batched prefill and active-request batched decode while preserving each request's
+independent K/V tensors. It also exposes queue limits, priorities, cancellation,
+and metrics for production-style admission control. Additional native experiments include a C++20/OpenMP
 backend with scalar, AVX2/FMA, and AVX512 dispatch; an optional pybind11 module;
-guarded Triton kernels for RMSNorm, SwiGLU, fused RMSNorm/QKV/RoPE, and
-FP16 matmul, single-query plus multi-batch page-table decode attention; optional CUDA C++
-fused-kernel, FP16 WMMA Tensor Core matmul, reduced paged-attention, and CUDA graph planning sources; and
-guarded CUTLASS, FlashAttention, and FlashInfer adapter contracts and wrappers.
+guarded Triton kernels for RMSNorm, SwiGLU, fused RMSNorm/QKV/RoPE, FP16 matmul,
+single-query plus multi-batch page-table decode attention; optional CUDA C++
+fused-kernel, FP16 WMMA Tensor Core matmul, reduced paged-attention, and CUDA
+graph planning sources; and guarded CUTLASS, FlashAttention, and FlashInfer
+adapter contracts and wrappers.
 
 ## Decode-First Design
 

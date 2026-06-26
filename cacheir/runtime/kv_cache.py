@@ -265,6 +265,9 @@ class PrefixCache:
     def __init__(self, capacity: int = 8):
         self.capacity = max(1, int(capacity))
         self._entries: OrderedDict[tuple[int, ...], dict[int, tuple[np.ndarray, np.ndarray]]] = OrderedDict()
+        self.hits = 0
+        self.misses = 0
+        self.evictions = 0
 
     def put(self, token_ids: list[int] | tuple[int, ...], snapshot: dict[int, tuple[np.ndarray, np.ndarray]]) -> None:
         key = tuple(int(token) for token in token_ids)
@@ -276,6 +279,7 @@ class PrefixCache:
         }
         while len(self._entries) > self.capacity:
             self._entries.popitem(last=False)
+            self.evictions += 1
 
     def longest_prefix(self, token_ids: list[int] | tuple[int, ...]) -> tuple[tuple[int, ...], dict[int, tuple[np.ndarray, np.ndarray]] | None]:
         query = tuple(int(token) for token in token_ids)
@@ -288,7 +292,16 @@ class PrefixCache:
         if best_value is not None:
             self._entries.move_to_end(best_key)
             best_value = {layer: (keys.copy(), values.copy()) for layer, (keys, values) in best_value.items()}
+            self.hits += 1
+        else:
+            self.misses += 1
         return best_key, best_value
 
     def stats(self) -> dict[str, int]:
-        return {"capacity": self.capacity, "entries": len(self._entries)}
+        return {
+            "capacity": self.capacity,
+            "entries": len(self._entries),
+            "hits": self.hits,
+            "misses": self.misses,
+            "evictions": self.evictions,
+        }

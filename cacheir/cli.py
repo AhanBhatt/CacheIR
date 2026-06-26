@@ -9,7 +9,7 @@ from cacheir.backends.upstream import probe_external_systems, run_installed_upst
 from cacheir.compiler import compile_model
 from cacheir.hardware import calibrate_bandwidth, profile_hardware
 from cacheir.importers.tiny import create_tiny_model
-from cacheir.runtime import Runtime
+from cacheir.runtime import create_runtime
 from cacheir.runtime.artifact import CompileArtifact
 from cacheir.visualize import export_graph
 
@@ -42,7 +42,7 @@ def _inspect(args: argparse.Namespace) -> None:
 
 
 def _run(args: argparse.Namespace) -> None:
-    runtime = Runtime(args.artifact)
+    runtime = create_runtime(args.artifact, backend=args.backend)
     for token in runtime.generate(args.prompt, max_new_tokens=args.max_new_tokens):
         print(token, end="", flush=True)
     print()
@@ -50,7 +50,16 @@ def _run(args: argparse.Namespace) -> None:
 
 def _benchmark(args: argparse.Namespace) -> None:
     artifact = CompileArtifact.load(args.artifact)
-    result = run_benchmark(artifact, prompt=args.prompt, decode_tokens=args.decode_tokens, repeats=args.repeats)
+    runtime_kwargs = {"dtype": args.cuda_dtype} if args.backend == "cuda" and args.cuda_dtype else None
+    result = run_benchmark(
+        artifact,
+        prompt=args.prompt,
+        decode_tokens=args.decode_tokens,
+        repeats=args.repeats,
+        backend=args.backend,
+        warmup=args.warmup,
+        runtime_kwargs=runtime_kwargs,
+    )
     text = json.dumps(result.to_dict(), indent=2)
     if args.output:
         save_benchmark(result, args.output)
@@ -95,7 +104,17 @@ def _serve(args: argparse.Namespace) -> None:
         raise SystemExit("Serving requires optional dependencies: pip install cacheir[server]") from exc
     from cacheir.runtime.server import create_app
 
-    uvicorn.run(create_app(args.artifact), host=args.host, port=args.port, reload=False)
+    uvicorn.run(
+        create_app(
+            args.artifact,
+            backend=args.backend,
+            max_batch_size=args.max_batch_size,
+            max_queue_size=args.max_queue_size,
+        ),
+        host=args.host,
+        port=args.port,
+        reload=False,
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -126,6 +145,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_cmd.add_argument("artifact")
     run_cmd.add_argument("--prompt", default="")
     run_cmd.add_argument("--max-new-tokens", type=int, default=16)
+    run_cmd.add_argument("--backend", default="auto", choices=["auto", "cpu", "cuda"])
     run_cmd.set_defaults(func=_run)
 
     bench_cmd = sub.add_parser("benchmark", help="benchmark prefill and decode separately")
@@ -133,7 +153,10 @@ def build_parser() -> argparse.ArgumentParser:
     bench_cmd.add_argument("--prompt", default="CacheIR benchmark prompt")
     bench_cmd.add_argument("--decode-tokens", type=int, default=16)
     bench_cmd.add_argument("--repeats", type=int, default=3)
+    bench_cmd.add_argument("--warmup", type=int, default=0)
     bench_cmd.add_argument("--output", default=None)
+    bench_cmd.add_argument("--backend", default="cpu", choices=["cpu", "cuda", "auto"])
+    bench_cmd.add_argument("--cuda-dtype", default="float16", choices=["float16", "float32", "auto"])
     bench_cmd.set_defaults(func=_benchmark)
 
     export_cmd = sub.add_parser("export", help="export graph IR as html, dot, or cir text")
@@ -161,6 +184,9 @@ def build_parser() -> argparse.ArgumentParser:
     serve_cmd.add_argument("artifact")
     serve_cmd.add_argument("--host", default="127.0.0.1")
     serve_cmd.add_argument("--port", type=int, default=8000)
+    serve_cmd.add_argument("--backend", default="auto", choices=["auto", "cpu", "cuda"])
+    serve_cmd.add_argument("--max-batch-size", type=int, default=4)
+    serve_cmd.add_argument("--max-queue-size", type=int, default=None)
     serve_cmd.set_defaults(func=_serve)
     return parser
 

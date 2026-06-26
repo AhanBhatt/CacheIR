@@ -112,7 +112,7 @@ def _markdown(rows: list[dict[str, object]]) -> str:
             )
         )
     lines.append("")
-    lines.append("Generated with `scripts/benchmark_matrix.py` against the active CacheIR CPU runtime; native C++ kernels are used when `_cacheir_native` is available.")
+    lines.append("Generated with `scripts/benchmark_matrix.py` against the active CacheIR CPU runtime; native RMSNorm/SiLU-multiply kernels are used when `_cacheir_native` is available, while native matmul is controlled by `CACHEIR_NATIVE_MATMUL`.")
     return "\n".join(lines)
 
 

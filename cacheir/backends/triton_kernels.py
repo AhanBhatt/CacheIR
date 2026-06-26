@@ -42,8 +42,8 @@ if triton_available():
         row = tl.program_id(0)
         offsets = tl.arange(0, BLOCK)
         mask = offsets < hidden
-        values = tl.load(x + row * hidden + offsets, mask=mask, other=0.0)
-        w = tl.load(weight + offsets, mask=mask, other=0.0)
+        values = tl.load(x + row * hidden + offsets, mask=mask, other=0.0).to(tl.float32)
+        w = tl.load(weight + offsets, mask=mask, other=0.0).to(tl.float32)
         variance = tl.sum(values * values, axis=0) / hidden
         normalized = values * tl.rsqrt(variance + eps) * w
         tl.store(out + row * hidden + offsets, normalized, mask=mask)
@@ -53,8 +53,8 @@ if triton_available():
         pid = tl.program_id(0)
         offsets = pid * BLOCK + tl.arange(0, BLOCK)
         mask = offsets < total
-        g = tl.load(gate + offsets, mask=mask, other=0.0)
-        u = tl.load(up + offsets, mask=mask, other=0.0)
+        g = tl.load(gate + offsets, mask=mask, other=0.0).to(tl.float32)
+        u = tl.load(up + offsets, mask=mask, other=0.0).to(tl.float32)
         silu = g / (1.0 + tl.exp(-g))
         tl.store(out + offsets, silu * u, mask=mask)
 

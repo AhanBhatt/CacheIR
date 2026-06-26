@@ -5,8 +5,9 @@ import statistics
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Any
 
-from cacheir.runtime import Runtime
+from cacheir.runtime import create_runtime
 from cacheir.runtime.artifact import CompileArtifact
 
 
@@ -30,22 +31,31 @@ def run_benchmark(
     prompt: str = "CacheIR benchmark prompt",
     decode_tokens: int = 16,
     repeats: int = 3,
+    backend: str = "cpu",
+    warmup: int = 0,
+    runtime_kwargs: dict[str, Any] | None = None,
 ) -> BenchmarkResult:
-    runtime = Runtime(artifact)
+    runtime = create_runtime(artifact, backend=backend, **(runtime_kwargs or {}))
     token_ids = runtime.tokenizer.encode(prompt)
     prefill_times = []
     decode_times = []
 
-    for _ in range(max(1, repeats)):
+    total_iterations = max(1, repeats) + max(0, warmup)
+    for iteration in range(total_iterations):
+        record = iteration >= max(0, warmup)
         start = time.perf_counter()
         logits = runtime.run([token_ids], mode="prefill")
-        prefill_times.append(time.perf_counter() - start)
-        next_id = int(logits[0, -1].argmax())
+        _synchronize(runtime)
+        if record:
+            prefill_times.append(time.perf_counter() - start)
+        next_id = _argmax_token(logits)
         for _decode in range(decode_tokens):
             start = time.perf_counter()
             logits = runtime.run([[next_id]], mode="decode")
-            decode_times.append(time.perf_counter() - start)
-            next_id = int(logits[0, -1].argmax())
+            _synchronize(runtime)
+            if record:
+                decode_times.append(time.perf_counter() - start)
+            next_id = _argmax_token(logits)
 
     prefill_avg = statistics.mean(prefill_times)
     decode_avg = statistics.mean(decode_times) if decode_times else 0.0
@@ -65,3 +75,17 @@ def save_benchmark(result: BenchmarkResult, output: str | Path) -> Path:
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(result.to_dict(), indent=2), encoding="utf-8")
     return out
+
+
+def _synchronize(runtime: object) -> None:
+    sync = getattr(runtime, "synchronize", None)
+    if callable(sync):
+        sync()
+
+
+def _argmax_token(logits: object) -> int:
+    tensor_slice = logits[0, -1]  # type: ignore[index]
+    argmax = getattr(tensor_slice, "argmax", None)
+    value = argmax() if callable(argmax) else tensor_slice.argmax()  # type: ignore[union-attr]
+    item = getattr(value, "item", None)
+    return int(item() if callable(item) else value)

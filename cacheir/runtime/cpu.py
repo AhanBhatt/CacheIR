@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Iterable
+import os
 
 import numpy as np
 
@@ -69,18 +70,43 @@ class WeightStore:
 class Runtime:
     """Execute compiled CacheIR graphs with a NumPy CPU backend."""
 
-    def __init__(self, artifact: CompileArtifact | str | Path):
+    def __init__(
+        self,
+        artifact: CompileArtifact | str | Path,
+        *,
+        weights: WeightStore | None = None,
+        tokenizer: TokenizerBridge | None = None,
+        prefix_cache: PrefixCache | None = None,
+    ):
         self.artifact = CompileArtifact.load(artifact) if isinstance(artifact, (str, Path)) else artifact
         graph = self.artifact.graph("decode")
-        self.weights = WeightStore(self.artifact.model_path, graph.weights, self.artifact.quant)
-        self.tokenizer = TokenizerBridge(self.artifact.model_path, self.artifact.config.vocab_size)
+        self.weights = weights or WeightStore(self.artifact.model_path, graph.weights, self.artifact.quant)
+        self.tokenizer = tokenizer or TokenizerBridge(self.artifact.model_path, self.artifact.config.vocab_size)
         page_size = int(graph.attrs.get("execution_hints", {}).get("page_size", 16))
         self.kv_cache = PagedKVCache(page_size=page_size)
-        self.prefix_cache = PrefixCache(capacity=8)
+        self.prefix_cache = prefix_cache or PrefixCache(capacity=8)
 
-    def run(self, input_ids: Iterable[Iterable[int]] | np.ndarray, *, mode: str = "prefill") -> np.ndarray:
+    def fork(self) -> "Runtime":
+        """Create an independent KV-cache session sharing weights and tokenizer."""
+
+        return Runtime(
+            self.artifact,
+            weights=self.weights,
+            tokenizer=self.tokenizer,
+            prefix_cache=self.prefix_cache,
+        )
+
+    def run(
+        self,
+        input_ids: Iterable[Iterable[int]] | np.ndarray,
+        *,
+        mode: str = "prefill",
+        reset_kv: bool | None = None,
+    ) -> np.ndarray:
         graph = self.artifact.graph(mode)
-        if mode == "prefill":
+        if reset_kv is None:
+            reset_kv = mode == "prefill"
+        if mode == "prefill" and reset_kv:
             self.kv_cache.clear()
         ids = np.asarray(input_ids, dtype=np.int64)
         if ids.ndim == 1:
@@ -97,9 +123,45 @@ class Runtime:
                 env[name] = value
         return env[graph.outputs[0]]
 
-    def generate(self, prompt: str, *, max_new_tokens: int = 16) -> Iterable[str]:
+    def prefill_tokens(
+        self,
+        token_ids: list[int] | tuple[int, ...],
+        *,
+        use_prefix_cache: bool = False,
+        remember_prefix: bool = False,
+    ) -> tuple[np.ndarray, tuple[int, ...]]:
+        ids = [int(token) for token in token_ids]
+        reused_prefix: tuple[int, ...] = ()
+        logits: np.ndarray
+        if use_prefix_cache and ids:
+            prefix, snapshot = self.prefix_cache.longest_prefix(ids)
+            if snapshot is not None and 0 < len(prefix) < len(ids):
+                self.kv_cache.load_prefix(snapshot)
+                reused_prefix = prefix
+                logits = self.run([ids[len(prefix) :]], mode="prefill", reset_kv=False)
+            else:
+                logits = self.run([ids], mode="prefill", reset_kv=True)
+        else:
+            logits = self.run([ids], mode="prefill", reset_kv=True)
+
+        if remember_prefix and ids:
+            self.remember_prefix(ids)
+        return logits, reused_prefix
+
+    def generate(
+        self,
+        prompt: str,
+        *,
+        max_new_tokens: int = 16,
+        use_prefix_cache: bool = False,
+        remember_prefix: bool = True,
+    ) -> Iterable[str]:
         token_ids = self.tokenizer.encode(prompt)
-        logits = self.run([token_ids], mode="prefill")
+        logits, _ = self.prefill_tokens(
+            token_ids,
+            use_prefix_cache=use_prefix_cache,
+            remember_prefix=remember_prefix and use_prefix_cache,
+        )
         for _ in range(max_new_tokens):
             next_id = int(np.argmax(logits[0, -1])) % self.artifact.config.vocab_size
             yield self.tokenizer.decode([next_id])
@@ -179,6 +241,8 @@ class Runtime:
             x = env[node.inputs[0]]
             gate = self._matmul(x, env[node.inputs[1]])
             up = self._matmul(x, env[node.inputs[2]])
+            if native.available() and hasattr(native, "silu_mul") and gate.dtype == np.float32 and up.dtype == np.float32:
+                return [native.silu_mul(gate, up)]
             return [(gate / (1.0 + np.exp(-gate))) * up]
         if op == "softmax":
             return [self._softmax(env[node.inputs[0]], axis=-1)]
@@ -193,14 +257,21 @@ class Runtime:
 
     @staticmethod
     def _matmul(x: np.ndarray, weight: np.ndarray) -> np.ndarray:
-        if native.available() and x.ndim == 3 and x.dtype == np.float32 and weight.dtype == np.float32:
+        policy = os.environ.get("CACHEIR_NATIVE_MATMUL", "numpy").lower()
+        use_native = policy in {"1", "true", "force"}
+        if policy == "auto" and x.ndim == 3:
+            rows = int(np.prod(x.shape[:-1]))
+            in_features = int(x.shape[-1])
+            out_features = int(weight.shape[0]) if weight.ndim == 2 else 0
+            use_native = rows >= 8 and in_features >= 256 and out_features <= 1024
+        if use_native and native.available() and x.ndim == 3 and x.dtype == np.float32 and weight.dtype == np.float32:
             return native.matmul_out_in(x, weight)
         return np.einsum("...i,oi->...o", x, weight, optimize=True)
 
     def _position_offset(self, layer: int, mode: str) -> int:
-        if mode != "decode" or layer not in self.kv_cache:
-            return 0
-        return self.kv_cache.length(layer)
+        if layer in self.kv_cache:
+            return self.kv_cache.length(layer)
+        return 0
 
     def _rope(self, q: np.ndarray, k: np.ndarray, attrs: dict[str, object], offset: int) -> tuple[np.ndarray, np.ndarray]:
         head_dim = int(attrs["head_dim"])
@@ -235,12 +306,7 @@ class Runtime:
         kh_new = k.reshape(batch, k.shape[1], kv_heads, head_dim)
         vh_new = v.reshape(batch, v.shape[1], kv_heads, head_dim)
 
-        if mode == "decode" and layer in self.kv_cache:
-            kh, vh = self.kv_cache.append(layer, kh_new, vh_new)
-        else:
-            if mode == "prefill" and layer in self.kv_cache:
-                self.kv_cache.clear()
-            kh, vh = self.kv_cache.append(layer, kh_new, vh_new)
+        kh, vh = self.kv_cache.append(layer, kh_new, vh_new)
 
         repeat = heads // kv_heads
         if repeat > 1:
@@ -252,7 +318,10 @@ class Runtime:
         scores = np.einsum("bqhd,bkhd->bhqk", qh, kh_attn, optimize=True) / math_sqrt(head_dim)
         if mode == "prefill":
             k_len = kh_attn.shape[1]
-            mask = np.triu(np.ones((q_len, k_len), dtype=bool), k=1)
+            past_len = max(0, k_len - q_len)
+            query_positions = past_len + np.arange(q_len, dtype=np.int64)[:, None]
+            key_positions = np.arange(k_len, dtype=np.int64)[None, :]
+            mask = key_positions > query_positions
             scores = np.where(mask[None, None, :, :], -1.0e30, scores)
         probs = self._softmax(scores, axis=-1)
         ctx = np.einsum("bhqk,bkhd->bqhd", probs, vh_attn, optimize=True)

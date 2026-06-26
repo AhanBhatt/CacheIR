@@ -122,6 +122,26 @@ void silu(ConstTensorView x, TensorView out) {
   }
 }
 
+void silu_mul(ConstTensorView gate, ConstTensorView up, TensorView out) {
+  if (gate.shape.size() != up.shape.size() || gate.shape.size() != out.shape.size()) {
+    throw std::invalid_argument("silu_mul expects matching ranks");
+  }
+  std::size_t total = 1;
+  for (std::size_t i = 0; i < gate.shape.size(); ++i) {
+    if (gate.shape[i] != up.shape[i] || gate.shape[i] != out.shape[i]) {
+      throw std::invalid_argument("silu_mul shape mismatch");
+    }
+    total *= gate.shape[i];
+  }
+#if CACHEIR_USE_OPENMP
+#pragma omp parallel for
+#endif
+  for (std::ptrdiff_t i = 0; i < static_cast<std::ptrdiff_t>(total); ++i) {
+    const float value = gate.data[i];
+    out.data[i] = (value / (1.0F + std::exp(-value))) * up.data[i];
+  }
+}
+
 void matmul_out_in(ConstTensorView x, ConstTensorView weight, TensorView out) {
   const auto in_features = checked_rank(x, 3, "matmul expects x rank 3");
   if (weight.shape.size() != 2 || weight.shape[1] != in_features) {

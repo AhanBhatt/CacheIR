@@ -1,11 +1,13 @@
 import struct
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 
 import numpy as np
 
 import cacheir.backends.native as native
 import cacheir.backends.adapters as adapter_mod
 import cacheir.backends.upstream as upstream_mod
+from cacheir.backends.vllm_compat import install_no_uva_fallback
 from cacheir.backends import native_available, probe_adapters, select_attention_backend, simd_backend
 from cacheir.backends.cuda_graphs import plan_decode_cuda_graph
 from cacheir.backends.upstream import (
@@ -366,8 +368,8 @@ def test_upstream_model_benchmark_helpers_build_real_commands(monkeypatch, tmp_p
     def fake_which(name):
         return {"vllm": "vllm", "llama-bench": "llama-bench"}.get(name)
 
-    def fake_run(cmd, capture_output, text, check, timeout):
-        calls.append(cmd)
+    def fake_run(cmd, capture_output, text, check, timeout, env=None):
+        calls.append((cmd, env))
         if "--output-json" in cmd:
             path = tmp_path / "vllm_latency.json"
             path.write_text('{"median_latency": 0.01}', encoding="utf-8")
@@ -384,9 +386,37 @@ def test_upstream_model_benchmark_helpers_build_real_commands(monkeypatch, tmp_p
     llama = upstream_mod.run_llama_cpp_benchmark(model)
     assert vllm["parsed"] == {"median_latency": 0.01}
     assert llama["parsed"] == [{"model_filename": "tiny.gguf", "avg_ts": 123.0}]
-    assert calls[0][:3] == ["vllm", "bench", "latency"]
-    assert "hf-internal-testing/tiny-random-LlamaForCausalLM" in calls[0]
-    assert calls[1][:3] == ["llama-bench", "-m", str(model)]
+    assert calls[0][0][:3] == ["vllm", "bench", "latency"]
+    assert "hf-internal-testing/tiny-random-LlamaForCausalLM" in calls[0][0]
+    assert calls[0][1]["CACHEIR_VLLM_NO_UVA_FALLBACK"] == "1"
+    assert str(tmp_path / "cacheir_vllm_compat") in calls[0][1]["PYTHONPATH"]
+    assert str(upstream_mod.Path(upstream_mod.__file__).resolve().parents[2]) in calls[0][1]["PYTHONPATH"]
+    assert (tmp_path / "cacheir_vllm_compat" / "sitecustomize.py").exists()
+    assert calls[1][0][:3] == ["llama-bench", "-m", str(model)]
+
+
+def test_vllm_no_uva_fallback_patches_buffer_utils(monkeypatch):
+    buffer_utils = ModuleType("vllm.v1.worker.gpu.buffer_utils")
+    buffer_utils.is_uva_available = lambda: False
+    buffer_utils._DEFAULT_MAX_CONCURRENCY = 2
+    buffer_utils.UvaBuffer = object
+    buffer_utils.UvaBufferPool = object
+    buffer_utils.UvaBackedTensor = object
+    parents = [
+        "vllm",
+        "vllm.v1",
+        "vllm.v1.worker",
+        "vllm.v1.worker.gpu",
+    ]
+    for name in parents:
+        monkeypatch.setitem(sys.modules, name, ModuleType(name))
+    monkeypatch.setitem(sys.modules, "vllm.v1.worker.gpu.buffer_utils", buffer_utils)
+
+    result = install_no_uva_fallback(force=True)
+    assert result["installed"] is True
+    assert buffer_utils._CACHEIR_NO_UVA_FALLBACK is True
+    assert buffer_utils.UvaBuffer.__name__ == "NoUvaBuffer"
+    assert buffer_utils.UvaBufferPool.__name__ == "NoUvaBufferPool"
 
 
 def test_mlir_cpp_dialect_registration_manifest():

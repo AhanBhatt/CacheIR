@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -48,8 +49,21 @@ def _has_module(name: str) -> bool:
         return False
 
 
+def _iree_available() -> bool:
+    if not (_has_module("iree.compiler") and _has_module("iree.runtime")):
+        return False
+    try:
+        from iree.compiler.tools import binaries
+
+        tool = binaries.find_tool("iree-compile")
+        result = subprocess.run([str(tool), "--version"], capture_output=True, text=True, check=False, timeout=5)
+    except Exception:
+        return False
+    return result.returncode == 0
+
+
 def probe_external_systems() -> dict[str, ExternalSystemStatus]:
-    iree_available = _has_module("iree.compiler") and _has_module("iree.runtime")
+    iree_available = _iree_available()
     tvm_available = _has_module("tvm")
     return {
         "vllm": ExternalSystemStatus(
@@ -196,10 +210,17 @@ def run_tvm_vector_add_benchmark(*, n: int = 256, number: int = 10, repeat: int 
     }
 
 
-def _command_result(name: str, cmd: list[str], *, timeout: int = 600, json_path: Path | None = None) -> dict[str, object]:
+def _command_result(
+    name: str,
+    cmd: list[str],
+    *,
+    timeout: int = 600,
+    json_path: Path | None = None,
+    env: dict[str, str] | None = None,
+) -> dict[str, object]:
     start = time.perf_counter()
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=timeout)
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=timeout, env=env)
     except FileNotFoundError:
         return {"name": name, "available": False, "command": cmd, "reason": "executable not found"}
     except subprocess.TimeoutExpired as exc:
@@ -256,6 +277,7 @@ def run_vllm_latency_benchmark(
     warmup_iters: int = 0,
     timeout: int = 900,
     extra_args: list[str] | None = None,
+    no_uva_fallback: bool = True,
 ) -> dict[str, object]:
     """Run vLLM's installed latency benchmark against a real local/HF model."""
 
@@ -290,12 +312,48 @@ def run_vllm_latency_benchmark(
     )
     if extra_args:
         cmd.extend(extra_args)
-    result = _command_result("vllm", cmd, timeout=timeout, json_path=output_path)
+    env = _vllm_compat_env(output_path.parent) if no_uva_fallback else None
+    result = _command_result("vllm", cmd, timeout=timeout, json_path=output_path, env=env)
     result["model"] = model
     result["input_len"] = input_len
     result["output_len"] = output_len
     result["batch_size"] = batch_size
+    result["no_uva_fallback"] = bool(no_uva_fallback)
     return result
+
+
+def _vllm_compat_env(workdir: Path) -> dict[str, str]:
+    compat_dir = workdir / "cacheir_vllm_compat"
+    compat_dir.mkdir(parents=True, exist_ok=True)
+    (compat_dir / "sitecustomize.py").write_text(
+        "\n".join(
+            [
+                "import os",
+                "if os.environ.get('CACHEIR_VLLM_NO_UVA_FALLBACK') == '1':",
+                "    try:",
+                "        from cacheir.backends.vllm_compat import install_no_uva_fallback",
+                "        install_no_uva_fallback()",
+                "    except Exception as exc:",
+                "        print(f'CacheIR vLLM no-UVA fallback failed: {exc}', flush=True)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    existing = env.get("PYTHONPATH")
+    project_root = Path(__file__).resolve().parents[2]
+    pythonpath = [str(compat_dir), str(project_root)]
+    if existing:
+        pythonpath.append(existing)
+    env["PYTHONPATH"] = os.pathsep.join(pythonpath)
+    env["CACHEIR_VLLM_NO_UVA_FALLBACK"] = "1"
+    cuda_home = Path("/usr/local/cuda")
+    if cuda_home.exists():
+        env.setdefault("CUDA_HOME", str(cuda_home))
+        cuda_bin = str(cuda_home / "bin")
+        env["PATH"] = os.pathsep.join([cuda_bin, env.get("PATH", "")])
+    return env
 
 
 def run_llama_cpp_benchmark(

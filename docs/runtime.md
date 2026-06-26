@@ -1,11 +1,28 @@
 # Runtime
 
 The runtime loads a `CompileArtifact`, creates a tokenizer bridge, loads weights,
-allocates a paged KV cache, and dispatches each scheduled node to reference CPU
-kernels.
+allocates KV-cache state, and dispatches each scheduled node through the selected
+backend.
 
 The CPU backend is a correctness backend. It uses NumPy kernels and simulates int4
 or int8 weight quantization by quantizing and dequantizing weights once on load.
+
+`CudaRuntime` executes the same CacheIR artifact on CUDA tensors. It keeps
+weights and KV state on GPU, supports fp16 or fp32 runtime dtype selection, uses
+SDPA attention, dispatches guarded Triton elementwise kernels for larger tensors,
+and caches packed QKV and Gate/Up weights to reduce decode launches. Forked CUDA
+sessions share page allocator accounting so page IDs, resident-page counts, and
+spillover markers live in one runtime namespace even while the reference K/V
+tensors remain per request. PyTorch is used as the CUDA tensor/cuBLAS substrate;
+CacheIR still owns graph execution and KV-cache state.
+
+When the scheduler admits CUDA sessions and prefix reuse is disabled, it can
+prefill variable-length prompts in one padded graph walk while slicing attention
+and KV writes back to each request's real sequence length. Active CUDA decode
+rounds can also run through `run_decode_batch`, batching norm/matmul/MLP work
+while preserving each request's independent K/V tensors at attention nodes. The
+scheduler also supports queue limits, request priorities, queued cancellation,
+and Prometheus-style counters for admission-control events.
 
 The KV cache exposes page metadata even though the reference arrays are contiguous.
 Prefix-cache snapshots and spillover policy markers let decode scheduling
@@ -29,5 +46,7 @@ Run locally:
 cacheir make-tiny examples/tiny_model
 cacheir compile examples/tiny_model --output examples/tiny_artifact
 cacheir run examples/tiny_artifact --prompt "CacheIR" --max-new-tokens 16
-cacheir serve examples/tiny_artifact
+cacheir benchmark examples/tiny_artifact --backend cuda --cuda-dtype float16 --warmup 2
+python scripts/benchmark_cuda_scheduler.py --max-batch-size 4 --cuda-dtype float16
+cacheir serve examples/tiny_artifact --max-batch-size 4 --max-queue-size 64
 ```

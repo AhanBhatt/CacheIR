@@ -77,20 +77,24 @@ five ideas:
   \item Expose each optimization pass as a textual graph diff.
   \item Emit memory plans, hardware hints, and execution schedules as first-class
         artifact data.
-  \item Provide a real reference runtime path that does not execute through
-        PyTorch.
+  \item Provide a real CPU reference runtime path that does not execute through
+        PyTorch, plus an optional CUDA backend where CacheIR still owns graph
+        execution and PyTorch supplies the tensor/cuBLAS substrate.
 \end{enumerate}
 
 The current implementation is a complete reference project. It includes an
 installable Python package, command-line interface, model importer skeletons,
 CacheIR graph IR, compiler passes, artifact bundles, graph visualization,
-benchmarks, a NumPy CPU runtime, a paged KV-cache reference implementation, an
-OpenAI-compatible local server, prefix-cache and calibrated spillover
-experiments, native GGUF dense and classic quantized block reads, StableHLO and
-MLIR-style round-trip experiments, a C++20/OpenMP AVX backend with an optional
-pybind11 bridge, guarded Triton kernels, optional CUDA fused-kernel sources,
-FP16 Tensor Core matmul experiments, IREE/TVM upstream benchmark bridges,
-accelerator adapter probes, Docker support, CI, and tests.
+benchmarks, a NumPy CPU runtime, an end-to-end CUDA artifact runtime, a paged
+KV-cache reference implementation, an OpenAI-compatible local server with health
+and metrics endpoints, prefix-cache reuse with counters, a small continuous-batch
+scheduler with CUDA batched prefill/decode paths, calibrated spillover
+experiments, native GGUF dense and classic
+quantized block reads, StableHLO and MLIR-style round-trip experiments, a
+C++20/OpenMP AVX backend with an optional pybind11 bridge, guarded Triton
+kernels, optional CUDA fused-kernel sources, FP16 Tensor Core matmul experiments,
+IREE/TVM upstream benchmark bridges, accelerator adapter probes, Docker support,
+CI, and tests.
 
 \section{High-Level Architecture}
 
@@ -122,7 +126,7 @@ cacheir/
   compiler.py            importer selection and pass pipeline
   importers/             HF, ONNX, GGUF, StableHLO, tiny model support
   passes/                compiler optimization passes
-  runtime/               artifacts, tokenizer, KV cache, CPU runtime, server
+  runtime/               artifacts, tokenizer, KV cache, CPU/CUDA runtimes, scheduler, server
   backends/              registry, native bridge, Triton kernels, upstream probes
   benchmark.py           benchmark runner
   visualize.py           HTML/DOT/IR/MLIR graph export
@@ -131,7 +135,7 @@ cacheir/
 cpp/                     C++20/OpenMP AVX backend and pybind11 module
 docs/                    Markdown and LaTeX documentation
 examples/                tiny model compile demo
-scripts/                 benchmark matrix and external comparison utilities
+scripts/                 benchmark matrix, scheduler, GPU, and external comparison utilities
 tests/                   pytest coverage
 \end{lstlisting}
 
@@ -361,6 +365,35 @@ maintains page metadata:
 This gives the compiler and runtime a stable policy contract that Triton and CUDA
 kernels can consume.
 
+\subsection{Prefix Cache and Continuous Batching}
+
+The runtime includes a small LRU \texttt{PrefixCache}. It stores KV-cache
+snapshots keyed by token prefixes and records hit, miss, and eviction counters.
+Prefill can restore a cached prefix and append only the uncached suffix while
+preserving RoPE offsets and causal masking. This makes prefix reuse observable
+and testable rather than a hidden serving optimization.
+
+The \texttt{ContinuousBatchScheduler} creates independent per-request KV-cache
+sessions with \texttt{Runtime.fork()}, while sharing weights, tokenizer state,
+and the prefix cache. The scheduler advances active requests in decode rounds
+and records submitted requests, completed requests, generated tokens,
+prefill/decode milliseconds, reused prefix tokens, scheduling rounds, and maximum
+observed batch size. The reference CPU backend still executes each request
+independently, but the scheduling contract mirrors the control surface a future
+shared GPU paged-KV runtime would consume.
+
+For CUDA sessions, the scheduler can batch variable-length prompt prefill when
+prefix reuse is disabled. Dense graph work runs over a padded batch, while
+attention and KV writes are sliced back to each request's real sequence length.
+Active decode rounds advance through \texttt{run\_decode\_batch}. The current
+implementation batches norm, matmul, residual, and MLP work while preserving
+each request's independent K/V tensors at attention nodes. Forked CUDA sessions
+share page allocator accounting, so page IDs and resident-page statistics live
+in one runtime namespace. The scheduler also supports queue limits, request
+priorities, queued cancellation, and admission-control metrics. This is not yet
+the final production design with persistent page-backed shared KV storage, but
+it is a real scheduler-level CUDA batching path.
+
 \subsection{Calibrated Spillover Cost Model}
 
 The spillover policy can be driven by a \texttt{SpilloverCostModel}. It records
@@ -382,13 +415,15 @@ The runtime performs the following steps:
   \item Convert input text to token IDs.
   \item Execute the prefill graph.
   \item Repeatedly execute the decode graph for greedy generation.
+  \item Optionally schedule multiple requests through
+        \texttt{ContinuousBatchScheduler}.
 \end{enumerate}
 
 \section{Backend Model}
 
 \subsection{CPU Reference Backend}
 
-The current executable backend is a NumPy CPU reference runtime. It implements:
+The CPU backend is a NumPy reference runtime. It implements:
 
 \begin{itemize}[leftmargin=*]
   \item token embedding
@@ -411,18 +446,18 @@ serving backend.
 \subsection{C++ Backend and pybind11 Bridge}
 
 The \texttt{cpp/} directory contains a C++20/OpenMP backend with kernels for
-RMSNorm, SiLU, and out-by-in matmul. The matmul and RMSNorm paths use a runtime
-dot-product dispatcher with scalar, AVX2/FMA, and AVX512 implementations where
-the compiler and host CPU support them. The static library builds with CMake and
-Ninja:
+RMSNorm, SiLU, fused SiLU-multiply, and out-by-in matmul. The matmul and RMSNorm
+paths use a runtime dot-product dispatcher with scalar, AVX2/FMA, and AVX512
+implementations where the compiler and host CPU support them. The static library
+builds with CMake and Ninja:
 
 \begin{lstlisting}
 cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=Release
 cmake --build cpp/build --config Release
 \end{lstlisting}
 
-The optional pybind11 module exposes native RMSNorm, out-by-in matmul, and SIMD
-capability reporting to Python:
+The optional pybind11 module exposes native RMSNorm, fused SiLU-multiply,
+out-by-in matmul, and SIMD capability reporting to Python:
 
 \begin{lstlisting}
 python -m pip install -e ".[native]"
@@ -433,6 +468,40 @@ cmake --build cpp/build --config Release
 On Windows, pinning \texttt{Python3\_EXECUTABLE} to the active interpreter avoids
 CMake choosing another Python installation. The latest local run installed
 \texttt{pybind11} from PyPI and built \texttt{\_cacheir\_native} successfully.
+The Python runtime dispatches native RMSNorm and fused SiLU-multiply
+automatically when available. Native matmul remains opt-in through
+\texttt{CACHEIR\_NATIVE\_MATMUL=force} or \texttt{CACHEIR\_NATIVE\_MATMUL=auto}
+because NumPy's optimized contraction is faster for many local decode shapes.
+
+\subsection{CUDA Artifact Runtime}
+
+\texttt{CudaRuntime} executes the same compiled CacheIR artifacts on CUDA
+tensors. It is not a replacement compiler pipeline and it does not hand execution
+to an upstream serving engine. CacheIR still owns graph traversal, KV-cache
+state, tokenizer integration, and kernel dispatch. PyTorch CUDA is used as the
+GPU tensor substrate and cuBLAS access path, while CacheIR dispatches its own
+Triton elementwise kernels where useful.
+
+The CUDA runtime includes:
+
+\begin{itemize}[leftmargin=*]
+  \item lazy CPU-to-GPU weight loading with fp16 or fp32 runtime dtype selection
+  \item GPU-resident KV-cache state with the same page metadata contract as the
+        CPU reference cache
+  \item artifact-driven prefill and decode graph execution
+  \item SDPA attention dispatch, which can use optimized CUDA attention kernels
+        available in the installed PyTorch build
+  \item guarded Triton RMSNorm and SiLU-multiply dispatch for larger tensors
+  \item cached packed QKV and Gate/Up weights, reducing decode matmul launches
+        for fused CacheIR nodes
+  \item \texttt{cacheir benchmark --backend cuda --cuda-dtype float16} support
+\end{itemize}
+
+This backend moves CacheIR beyond isolated GPU kernel microbenchmarks: complete
+decoder artifacts can now execute on the RTX 5070 Laptop GPU. It is still not a
+production serving backend because persistent page-backed KV storage used
+directly by fused attention kernels, packed quantized GEMM, CUDA graph replay,
+and large-model coverage remain future work.
 
 \subsection{GPU and Triton Target Surface}
 
@@ -542,6 +611,7 @@ cacheir make-tiny examples/tiny_model
 cacheir compile examples/tiny_model --output examples/tiny_artifact
 cacheir inspect examples/tiny_artifact --mode decode
 cacheir benchmark examples/tiny_artifact --decode-tokens 32 --repeats 3
+cacheir benchmark examples/tiny_artifact --backend cuda --cuda-dtype float16 --warmup 2
 cacheir external --benchmark --workdir .tmp/upstream
 cacheir export examples/tiny_artifact examples/decode.html --mode decode
 cacheir run examples/tiny_artifact --prompt "CacheIR"
@@ -610,6 +680,44 @@ The output reports:
   \item KV-cache page statistics
 \end{itemize}
 
+\subsection{CUDA Runtime Benchmark}
+
+The dedicated CUDA runtime benchmark compares the CPU reference backend and the
+CUDA artifact backend through the same benchmark API:
+
+\begin{lstlisting}
+python scripts/benchmark_cuda_runtime.py \
+  --output .tmp/reports/cuda_runtime_benchmark_h1024_latest.json \
+  --repeats 3 \
+  --warmup 1 \
+  --decode-tokens 8 \
+  --hidden-size 1024 \
+  --num-layers 4 \
+  --cuda-dtype float16
+\end{lstlisting}
+
+\begin{longtable}{p{0.22\linewidth}p{0.18\linewidth}p{0.14\linewidth}p{0.16\linewidth}p{0.14\linewidth}p{0.14\linewidth}}
+\toprule
+\textbf{Shape} & \textbf{Backend} & \textbf{Prefill ms} & \textbf{Decode ms/tok} &
+\textbf{Prefill tok/s} & \textbf{Decode tok/s} \\
+\midrule
+h128, 2 layers & CPU fp32 & 2.122 & 1.007 & 17,432.8 & 993.0 \\
+h128, 2 layers & CUDA fp16 & 3.058 & 3.210 & 12,099.6 & 311.5 \\
+h512, 2 layers & CPU fp32 & 5.828 & 2.077 & 6,348.3 & 481.4 \\
+h512, 2 layers & CUDA fp16 & 3.867 & 4.030 & 9,567.5 & 248.1 \\
+h1024, 4 layers & CPU fp32 & 30.984 & 12.271 & 1,194.1 & 81.5 \\
+h1024, 4 layers & CUDA fp16 & 7.533 & 7.573 & 4,912.0 & 132.1 \\
+h2048, 4 layers & CPU fp32 & 94.036 & 30.619 & 393.5 & 32.7 \\
+h2048, 4 layers & CUDA fp16 & 6.705 & 7.333 & 5,517.9 & 136.4 \\
+\bottomrule
+\end{longtable}
+
+The CUDA backend is slower on very small toy shapes where launch overhead
+dominates. It crosses over as the model becomes compute-heavy: h1024/l4 is
+4.11x faster on prefill and 1.62x faster on decode, while h2048/l4 is 14.02x
+faster on prefill and 4.18x faster on decode. The result proves end-to-end GPU
+model execution, not production parity with mature LLM serving engines.
+
 \subsection{Benchmark Matrix}
 
 The repository includes \texttt{scripts/benchmark\_matrix.py}, which generates
@@ -622,6 +730,54 @@ python scripts/benchmark_matrix.py \
   --repeats 3 \
   --decode-tokens 16
 \end{lstlisting}
+
+\subsection{Scheduler Benchmark}
+
+The repository also includes \texttt{scripts/benchmark\_scheduler.py}. It
+creates or loads a CacheIR artifact, submits prompts to
+\texttt{ContinuousBatchScheduler}, and reports request throughput, generated
+token throughput, prefix reuse, and scheduling metrics:
+
+\begin{lstlisting}
+python scripts/benchmark_scheduler.py \
+  --output .tmp/reports/scheduler_benchmark.json \
+  --repeats 3 \
+  --max-new-tokens 8 \
+  --max-batch-size 4
+\end{lstlisting}
+
+\subsection{CUDA Scheduler Benchmark}
+
+The CUDA scheduler benchmark compares sequential CUDA sessions with
+variable-length batched prefill and active-request batched decode:
+
+\begin{lstlisting}
+python scripts/benchmark_cuda_scheduler.py \
+  --output .tmp/reports/cuda_scheduler_benchmark_latest.json \
+  --repeats 3 \
+  --warmup 1 \
+  --max-batch-size 4 \
+  --max-new-tokens 16 \
+  --hidden-size 1024 \
+  --num-layers 4 \
+  --cuda-dtype float16
+\end{lstlisting}
+
+\begin{longtable}{p{0.24\linewidth}p{0.26\linewidth}p{0.18\linewidth}p{0.18\linewidth}}
+\toprule
+\textbf{Shape} & \textbf{Mode} & \textbf{Median ms} & \textbf{Gen tok/s} \\
+\midrule
+h1024/l4, batch 4 & Sequential & 582.177 & 109.9 \\
+h1024/l4, batch 4 & Batched prefill + decode & 339.796 & 188.3 \\
+h2048/l4, batch 4 & Sequential & 867.240 & 37.0 \\
+h2048/l4, batch 4 & Batched prefill + decode & 684.002 & 46.8 \\
+\bottomrule
+\end{longtable}
+
+The h1024/l4 run improves latency and generated-token throughput by 1.71x. The
+h2048/l4 run improves by 1.27x. These runs processed 134 real prefill tokens and
+6 padding tokens. The shorter h2048 decode window leaves prefill as the dominant
+cost, and attention still splits per request after the dense padded graph work.
 
 \subsection{Installed Upstream Benchmarks}
 
@@ -654,37 +810,64 @@ llama.cpp helper drives \texttt{llama-bench}.
 
 \subsection{Local Native Experiment Snapshot}
 
-The latest local verification on 2026-06-24 installed the full optional project
+The latest local verification on 2026-06-25 installed the full optional project
 stack with \texttt{python -m pip install -e ".[dev,server,importers,benchmark,native,gpu]"}.
-That installed PyPI \texttt{pybind11}, \texttt{triton-windows}, ONNX/importer
-dependencies, server dependencies, and benchmark dependencies. MSVC Build Tools
-2022 were installed at \texttt{C:\textbackslash BuildTools}, and \texttt{cl.exe}
-was added to the user PATH.
+The native pybind11 module built successfully for Python 3.13 and reported
+\texttt{simd\_backend() == "avx512"}. Native RMSNorm, matmul, and fused
+SiLU-multiply matched NumPy within float32 tolerance. The runtime now dispatches
+native RMSNorm and fused SiLU-multiply by default, while native matmul is
+opt-in because NumPy's optimized contraction is faster for many local decode
+shapes.
 
-The native smoke test reported \texttt{simd\_backend() == "avx512"} and matched
-NumPy RMSNorm and matmul within float32 tolerance. CUDA Torch
-\texttt{2.12.1+cu130} was installed and CUDA was available on the RTX 5070
-Laptop GPU. The CUDA C++ target built with MSVC/NVCC, producing
-\texttt{cacheir\_cuda\_kernels.lib}. CUDA FP16 WMMA Tensor Core matmul and the
-reduced CUDA paged-attention path also built with MSVC/NVCC. Triton GPU kernels
-executed on CUDA and matched Torch references for RMSNorm, SwiGLU, FP16 matmul,
-single-query decode attention, and multi-batch page-table decode attention. The
-CUTLASS adapter probe detects the installed \texttt{cutlass\_cppgen} module.
+The CPU benchmark matrix ran 18 rows covering three tiny model sizes, fp32 and
+simulated int4 variants, three prompt lengths, three repeats, and 16 decode
+tokens. Selected results: \texttt{tiny\_1l\_h16} fp32 short decode was
+0.571 ms/token, \texttt{small\_2l\_h32} fp32 short decode was 0.974 ms/token,
+and \texttt{medium\_4l\_h64} fp32 medium decode was 2.169 ms/token.
+
+The scheduler benchmark processed four requests and 32 generated tokens in a
+median 54.819 ms, or 72.97 requests/s and 583.74 generated tokens/s, while
+reusing 70 prompt tokens through the prefix cache.
+
+The CUDA scheduler benchmark executed four CUDA sessions with variable-length
+batched prefill and active-request batched decode. On h1024/l4, batch-4 latency
+improved from 582.177 ms to 339.796 ms and generated-token throughput improved
+from 109.9 tok/s to 188.3 tok/s. On h2048/l4, batch-4 latency improved from
+867.240 ms to 684.002 ms and throughput improved from 37.0 tok/s to
+46.8 tok/s. A smaller h128/l1 Triton batched-decode smoke run also executed
+through the scheduler path with \texttt{--use-triton-attention}.
+
+CUDA Torch \texttt{2.12.1+cu130} was available on the RTX 5070 Laptop GPU. The
+Triton kernel benchmark measured RMSNorm at 0.0157 ms, SiLU-multiply at
+0.0213 ms, FP16 matmul at 0.0667 ms or 8.05 TFLOP/s, single-query decode
+attention at 0.0552 ms, and multi-batch page-table decode attention at
+0.0566 ms. Torch matmul remained faster at 0.0275 ms or 19.54 TFLOP/s for the
+same FP16 GEMM shape.
+
+The end-to-end CUDA runtime benchmark executed full decoder artifacts with fp16
+weights, GPU-resident KV state, SDPA attention, Triton elementwise dispatch
+gates, and cached packed QKV/Gate-Up weights. The h1024/l4 CUDA fp16 run
+measured 7.533 ms prefill and 7.573 ms/token decode versus CPU fp32 at
+30.984 ms prefill and 12.271 ms/token decode. The h2048/l4 CUDA fp16 run
+measured 6.705 ms prefill and 7.333 ms/token decode versus CPU fp32 at
+94.036 ms prefill and 30.619 ms/token decode.
+
 \texttt{iree-base-compiler 3.11.0}, \texttt{iree-base-runtime 3.11.0}, and
 \texttt{apache-tvm 0.25.0} installed from PyPI. The upstream benchmark command
 compiled a StableHLO add module through IREE to a 9,781-byte VMFB and ran
 \texttt{iree-benchmark-module}; TVM built and ran a TE vector-add benchmark with
-checksum 512.0. A calibrated profile run measured CPU copy at 8.05 GB/s and CUDA
-host-to-device transfer at 2.85 GB/s for a 1 MiB sample on this host. The
-WSL2 CUDA environments validated direct FlashAttention prefill and FlashInfer
-decode execution through CacheIR's adapter wrappers. A CUDA llama.cpp build ran
-a real \texttt{llama-bench} model benchmark against a locally converted GGUF
-tiny Llama model. The vLLM helper launched against the same tiny HF model, but
-the local WSL vLLM 0.23.0 CUDA worker failed during initialization with
-\texttt{RuntimeError: UVA is not available}; the failure metadata is captured
-for reproducibility. The benchmark matrix ran 18 rows covering three tiny model
-sizes, fp32 and simulated int4 variants, three prompt lengths, three repeats,
-and 16 decode tokens.
+checksum 512.0. A calibrated profile run measured CPU copy at 32.04 GB/s and
+CUDA host-to-device transfer at 13.98 GB/s for a 16 MiB sample on this host.
+
+The WSL2 CUDA environment installed NVIDIA CUDA Toolkit 13.3 at
+\texttt{/usr/local/cuda}. CacheIR's vLLM launcher now injects the no-UVA fallback
+and exports the CUDA toolkit path so FlashInfer JIT can find \texttt{nvcc}. A
+real vLLM 0.23.0 latency benchmark with Torch 2.11.0+cu130 and FlashInfer ran
+against a CacheIR-created tiny Llama h128 model: 28.535 ms average latency for a
+16 input + 8 output token request. The matched CacheIR CPU reference estimate
+for the same toy request was 25.425 ms, computed from 10.553 ms prefill and
+1.859 ms/token decode. This is a toy batch-1 comparison and does not imply
+general superiority over vLLM.
 
 \section{Testing and Validation}
 
@@ -698,16 +881,27 @@ The test suite covers:
   \item artifact bundle loading
   \item graph export
   \item runtime prefill and decode
+  \item CUDA runtime prefill/decode parity with the CPU reference when CUDA is
+        available
+  \item CUDA scheduler variable-length batched prefill, shared page allocator
+        accounting, and active-request batched decode parity with sequential
+        CUDA sessions
+  \item scheduler queue limits, request priorities, and queued cancellation
+  \item prefix-cache-aware prefill equivalence
   \item KV-cache growth
   \item greedy generation
+  \item continuous-batch scheduler metrics
+  \item server health, metrics, and batch completions
   \item benchmark execution
   \item hardware profile serialization
   \item quantized lowering and runtime compatibility
   \item GGUF dense and \texttt{Q4\_0}/\texttt{Q4\_1}/\texttt{Q5\_0}/\texttt{Q5\_1}/\texttt{Q8\_0}/\texttt{Q8\_1} tensor reads
   \item StableHLO import with reduce-region metadata and MLIR-style dialect export/parser/verifier round trip
   \item calibrated spillover cost model and adapter probe behavior
-  \item native pybind11 RMSNorm and matmul parity when the extension is built
+  \item native pybind11 RMSNorm, matmul, and fused SiLU-multiply parity when the extension is built
 \end{itemize}
+
+The latest full local test run passed 34 tests.
 
 Recommended validation commands:
 
@@ -725,7 +919,8 @@ cmake --build cpp/build --config Release
 \textbf{Area} & \textbf{Technologies} \\
 \midrule
 Primary languages & Python 3.10+, C++20. \\
-Numerical runtime & NumPy reference kernels. \\
+Numerical runtime & NumPy reference kernels plus optional PyTorch CUDA tensor
+substrate for the CacheIR CUDA executor. \\
 Compiler IR & Custom CacheIR graph IR with JSON and textual representations. \\
 Model import & Hugging Face config conventions, NPZ, safetensors optional,
 ONNX optional, GGUF metadata plus dense \texttt{F32}/\texttt{F16}/\texttt{BF16}/\texttt{I8}/\texttt{I16}/\texttt{I32}/\texttt{I64}/\texttt{F64} and
@@ -736,21 +931,30 @@ Optimization passes & Shape inference, constant folding, operator fusion,
 layout conversion, dead node elimination, mode specialization, quantization-aware
 lowering, schedule and memory planning. \\
 CPU backend & NumPy reference runtime, C++20/OpenMP native library, scalar,
-AVX2/FMA, and AVX512 dispatch, optional pybind11 bridge, runtime native dispatch. \\
-GPU backend surface & CUDA/Triton target naming, schedule metadata, guarded
-Triton RMSNorm, SiLU/SwiGLU, FP16 matmul, fused RMSNorm/QKV/RoPE, single-query decode
-attention, and multi-batch page-table decode-attention kernels, optional CUDA
-C++ fused kernels, FP16 WMMA Tensor Core matmul, reduced paged-attention decode,
-batched paged-attention ABI, and CUDA graph planning. \\
+AVX2/FMA, and AVX512 dispatch, optional pybind11 bridge, native RMSNorm and
+fused SiLU-multiply dispatch, opt-in native matmul policy. \\
+GPU backend surface & CUDA/Triton target naming, schedule metadata,
+\texttt{CudaRuntime}, fp16 CUDA weight loading, GPU-resident KV state, SDPA
+attention dispatch, cached packed QKV/Gate-Up weights, shared CUDA page
+allocator accounting, variable-length CUDA prefill batching,
+scheduler-integrated CUDA decode batching, guarded Triton RMSNorm,
+SiLU/SwiGLU, FP16 matmul, fused RMSNorm/QKV/RoPE, single-query decode attention,
+and multi-batch page-table decode-attention kernels, optional CUDA C++ fused
+kernels, FP16 WMMA Tensor Core matmul, reduced paged-attention decode, batched
+paged-attention ABI, and CUDA graph planning. \\
 Accelerator adapters & Optional CUTLASS, FlashAttention, and FlashInfer probes,
 dispatch contracts, and guarded direct wrappers. \\
 Quantization & int4/int8-style lowering and CPU-side quantize/dequantize
 simulation. \\
-Serving & FastAPI and Uvicorn optional dependencies. \\
+Serving & FastAPI and Uvicorn optional dependencies, OpenAI-compatible
+completions/chat, streaming, \texttt{/healthz}, \texttt{/metrics}, CacheIR batch
+completions, queue limits, priorities, cancellation, and admission counters. \\
 Testing & pytest, compileall, CMake build checks. \\
-Benchmarking & CacheIR benchmark CLI, benchmark matrix script, and comparison
-harness for vLLM, llama.cpp, IREE, and TVM commands plus installed IREE/TVM
-smoke benchmark execution and model-aware vLLM/llama.cpp helpers. \\
+Benchmarking & CacheIR benchmark CLI with CPU/CUDA backend selector, benchmark
+matrix script, CUDA runtime benchmark, CUDA scheduler benchmark, scheduler
+benchmark, GPU kernel benchmark, and comparison harness for vLLM, llama.cpp,
+IREE, and TVM commands plus installed IREE/TVM smoke benchmark execution and
+model-aware vLLM/llama.cpp helpers. \\
 Visualization & HTML, DOT, text IR, and MLIR-style CacheIR dialect export plus
 parser/verifier round trip. \\
 Build and packaging & pyproject.toml, setuptools, CMake, Ninja, Docker,
@@ -767,15 +971,26 @@ not default runtime dependencies. \\
 
 \begin{itemize}[leftmargin=*]
   \item CPU reference execution without PyTorch.
+  \item End-to-end CUDA artifact execution through \texttt{CudaRuntime}.
+  \item CUDA fp16 weight loading, GPU-resident KV state, SDPA attention dispatch,
+        and cached packed QKV/Gate-Up weights.
+  \item Scheduler-integrated variable-length CUDA prefill batching and
+        active-request CUDA decode batching.
+  \item Shared CUDA page allocator accounting across forked request sessions.
   \item Prefill and decode graph specialization.
   \item Paged KV-cache reference behavior.
-  \item Prefix-cache reuse and calibrated spillover policy experiments.
+  \item Prefix-cache reuse with counters and calibrated spillover policy experiments.
+  \item Forked per-request runtime sessions sharing weights and tokenizer state.
+  \item Continuous-batch scheduler with prefix reuse metrics, queue limits,
+        priorities, cancellation, and admission-control counters.
+  \item Server health, Prometheus-style metrics, streaming, and batch completions.
   \item Artifact bundles, pass diffs, graph export, benchmarks, and server
         entrypoint.
   \item Quantization-aware lowering with CPU-side quantize/dequantize simulation.
   \item C++20 backend library build with scalar, AVX2/FMA, and AVX512 dispatch.
-  \item Optional pybind11 bridge for native RMSNorm and matmul kernels, with
-        runtime dispatch when \texttt{\_cacheir\_native} is importable.
+  \item Optional pybind11 bridge for native RMSNorm, matmul, and fused
+        SiLU-multiply kernels.
+  \item Native matmul policy with NumPy default and opt-in native force/auto modes.
   \item Guarded Triton RMSNorm, SiLU/SwiGLU, fused RMSNorm/QKV/RoPE,
         single-query decode attention, and multi-batch page-table decode
         attention kernels.
@@ -795,6 +1010,9 @@ not default runtime dependencies. \\
         direct wrappers for prefill, single decode, and batch paged decode.
   \item Direct FlashAttention and FlashInfer smoke execution on WSL2 CUDA
         environments with compatible wheels.
+  \item vLLM no-UVA fallback, CacheIR project-root propagation into spawned
+        workers, CUDA Toolkit 13.3 path export, and runnable WSL2 CUDA vLLM
+        comparison.
   \item Calibrated low-VRAM CPU/GPU spillover cost model with measured bandwidth calibration.
   \item IREE StableHLO compile/runtime benchmark integration through upstream
         IREE wheels.
@@ -804,13 +1022,54 @@ not default runtime dependencies. \\
         helpers.
 \end{itemize}
 
-\subsection{Remaining Environment Caveat}
+\subsection{Honest Evaluation}
 
-No active in-repository milestone remains open. The remaining caveat is specific
-to this host: vLLM is installed in WSL2 and the real model benchmark helper
-launches, but the local CUDA worker fails before inference with
-\texttt{RuntimeError: UVA is not available}. The failed benchmark metadata is
-kept as a reproducibility artifact rather than hidden.
+CacheIR is a real, inspectable transformer compiler/runtime project, but it is
+not yet a production peer of vLLM, TensorRT-LLM, llama.cpp, or MLC LLM on real
+model sizes. The current honest scorecard is:
+
+\begin{longtable}{p{0.42\linewidth}p{0.12\linewidth}p{0.36\linewidth}}
+\toprule
+\textbf{Dimension} & \textbf{Score} & \textbf{Reason} \\
+\midrule
+Explainable LLM compiler project & 8/10 & Real IR, passes, artifacts, diffs,
+memory plans, imports, tests, and documentation. \\
+Research/portfolio systems project & 8/10 & Broad, runnable, benchmarked, and
+inspectable. \\
+Production LLM serving system & 7/10 & Serving APIs, scheduler, metrics, prefix
+reuse, queue limits, priorities, cancellation, CUDA model runtime, shared page
+accounting, and variable-length CUDA scheduler batching exist; persistent
+page-backed fused attention and reliability hardening are still missing. \\
+Raw performance competitor & 6/10 & CUDA fp16 runtime, Triton kernels, batched
+decode attention smoke execution, and CUDA scheduler batching show measured
+speedups on larger toy shapes, but tuned quantized GEMM and large-model evidence
+are still missing. \\
+\bottomrule
+\end{longtable}
+
+\subsection{Remaining Work Toward an 8/10 Production Score}
+
+\begin{itemize}[leftmargin=*]
+  \item Persistent page-backed shared GPU KV storage used directly by scheduler
+        fused decode kernels, beyond the current shared allocator accounting.
+  \item Fused multi-request paged attention using that persistent shared GPU
+        page pool instead of repacking per-request K/V tensors for reference
+        kernels.
+  \item Packed int4/int8 quantized GEMM with real compression and loader
+        integration.
+  \item Tuned GEMM paths through CUTLASS, cuBLASLt, Triton autotuning, and
+        shape-specific kernel selection.
+  \item Production continuous batching hardening: streaming backpressure,
+        preemption, fairness policies, bounded latency tests, and long-running
+        queue soak tests.
+  \item Large-model coverage and benchmarks on 0.5B, 1.5B, and 7B-class local
+        models.
+  \item Real apples-to-apples throughput and latency comparisons against vLLM,
+        llama.cpp, TensorRT-LLM, MLC LLM, IREE, and TVM where those systems are
+        installed.
+  \item Reliability hardening for memory limits, OOM recovery, tokenizer edge
+        cases, model-family conformance, and long-context soak tests.
+\end{itemize}
 
 \section{Building PDF or ODF Outputs}
 
@@ -832,13 +1091,18 @@ pandoc docs/latex/cacheir_project_documentation.tex \
 
 \section{Conclusion}
 
-CacheIR is a compact but complete transformer inference compiler project. It
+CacheIR is a compact but substantial transformer inference compiler project. It
 prioritizes clarity, pass-level explainability, prefill/decode specialization,
 and KV-cache-aware runtime behavior. The NumPy CPU backend establishes a correct
 reference path, while the artifact format, schedules, C++ AVX backend, optional
-pybind11 bridge, GGUF/StableHLO/MLIR experiments, guarded Triton kernels,
-CUDA fused-kernel sources, accelerator adapter probes, and calibrated spillover
-model, IREE StableHLO bridge, and TVM benchmark bridge provide concrete native
-performance and upstream comparison surfaces.
+pybind11 bridge, CUDA artifact runtime, GGUF/StableHLO/MLIR experiments, guarded
+Triton kernels, CUDA fused-kernel sources, accelerator adapter probes, and
+calibrated spillover model, IREE StableHLO bridge, and TVM benchmark bridge
+provide concrete native performance and upstream comparison surfaces. The
+project is now strong as an explainable compiler and systems artifact, but
+reaching production serving and raw performance parity with mature LLM engines
+still requires persistent page-backed shared GPU KV execution, packed quantized
+GEMM, tuned large-model CUDA paths, production reliability hardening, and
+large-model benchmark evidence.
 
 \end{document}

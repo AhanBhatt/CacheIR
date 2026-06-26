@@ -59,3 +59,9 @@ def matmul_out_in(x: np.ndarray, weight: np.ndarray) -> np.ndarray:
     if _NATIVE is None:
         raise RuntimeError("CacheIR native extension is not available")
     return _NATIVE.matmul_out_in(np.asarray(x, dtype=np.float32), np.asarray(weight, dtype=np.float32))
+
+
+def silu_mul(gate: np.ndarray, up: np.ndarray) -> np.ndarray:
+    if _NATIVE is None or not hasattr(_NATIVE, "silu_mul"):
+        raise RuntimeError("CacheIR native extension does not provide silu_mul")
+    return _NATIVE.silu_mul(np.asarray(gate, dtype=np.float32), np.asarray(up, dtype=np.float32))

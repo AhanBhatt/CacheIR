@@ -20,6 +20,7 @@ from cacheir.backends.upstream import (
     run_llama_cpp_benchmark,
     run_vllm_latency_benchmark,
 )
+from cacheir.backends.vllm_compat import install_no_uva_fallback
 from cacheir.backends.native import available as native_available, simd_backend
 
 __all__ = [
@@ -35,6 +36,7 @@ __all__ = [
     "flashinfer_batch_paged_decode",
     "flashinfer_paged_decode",
     "compile_stablehlo_with_iree",
+    "install_no_uva_fallback",
     "native_available",
     "plan_decode_cuda_graph",
     "probe_adapters",
