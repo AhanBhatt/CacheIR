@@ -8,9 +8,10 @@ from typing import Any, Iterable
 
 import numpy as np
 
+from cacheir.quantization import PackedQuantizedTensor
 from cacheir.ir import Graph, Node
 from cacheir.runtime.artifact import CompileArtifact
-from cacheir.runtime.cpu import WeightStore
+from cacheir.runtime.cpu import WeightStore, _quantized_weight_inputs
 from cacheir.runtime.kv_cache import KVPage, PrefixCache
 from cacheir.runtime.tokenizer import TokenizerBridge
 
@@ -61,6 +62,7 @@ class CudaWeightStore:
         self.device = device
         self.dtype = dtype
         self._cache: dict[str, Any] = {}
+        self._qcache: dict[str, CudaPackedQuantizedTensor] = {}
 
     def get(self, value_name: str) -> Any:
         if value_name in self._cache:
@@ -71,6 +73,36 @@ class CudaWeightStore:
         tensor = tensor.to(device=self.device, dtype=dtype, non_blocking=False)
         self._cache[value_name] = tensor.contiguous()
         return self._cache[value_name]
+
+    def get_quantized(self, value_name: str) -> "CudaPackedQuantizedTensor":
+        if value_name in self._qcache:
+            return self._qcache[value_name]
+        packed = self.base.get_quantized(value_name)
+        values = self.torch.from_numpy(np.ascontiguousarray(packed.packed_values)).to(device=self.device, non_blocking=False)
+        scales = self.torch.from_numpy(np.ascontiguousarray(packed.scales)).to(device=self.device, dtype=self.torch.float32, non_blocking=False)
+        zero_points = self.torch.from_numpy(np.ascontiguousarray(packed.zero_points)).to(device=self.device, dtype=self.torch.float32, non_blocking=False)
+        result = CudaPackedQuantizedTensor(
+            packed_values=values.contiguous(),
+            scales=scales.contiguous(),
+            zero_points=zero_points.contiguous(),
+            bits=packed.bits,
+            shape=packed.shape,
+            axis=packed.axis,
+            group_size=packed.group_size,
+        )
+        self._qcache[value_name] = result
+        return result
+
+
+@dataclass
+class CudaPackedQuantizedTensor:
+    packed_values: Any
+    scales: Any
+    zero_points: Any
+    bits: int
+    shape: tuple[int, int]
+    axis: int = 1
+    group_size: int | None = None
 
 
 @dataclass
@@ -87,12 +119,12 @@ class _TorchLayerKVCache:
 
 
 class TorchKVPageAllocator:
-    """Shared page-id allocator for CUDA KV-cache sessions.
+    """Shared page-id allocator and persistent CUDA KV page pool.
 
-    The CUDA runtime still keeps each request's K/V tensors contiguous for the
-    reference kernels, but page allocation is global across forked sessions. That
-    gives the scheduler one page namespace, resident-page accounting, and a
-    place for spillover policy experiments to make decisions.
+    Forked request sessions share one page namespace and one set of layer-local
+    K/V page tensors. Reference SDPA still keeps a contiguous per-session view,
+    but fused decode kernels can now read the persistent page pool directly
+    instead of repacking per-request K/V into temporary page tensors.
     """
 
     _owner_counter = itertools.count(1)
@@ -105,6 +137,9 @@ class TorchKVPageAllocator:
         self._resident: OrderedDict[int, dict[str, object]] = OrderedDict()
         self.spilled_pages: list[dict[str, object]] = []
         self.released_pages = 0
+        self._pools: dict[tuple[int, str, str, int, int], dict[str, Any]] = {}
+        self.pool_writes = 0
+        self.pool_grows = 0
 
     def new_owner(self) -> str:
         return f"cuda-session-{next(self._owner_counter)}"
@@ -134,6 +169,64 @@ class TorchKVPageAllocator:
             self._resident.pop(page_id, None)
         self.released_pages += len(released)
 
+    def write_page(self, *, layer: int, page: KVPage, keys: Any, values: Any) -> None:
+        if keys.ndim != 3 or values.ndim != 3:
+            return
+        token_count = min(int(keys.shape[0]), int(values.shape[0]), int(page.length), self.page_size)
+        if token_count <= 0:
+            return
+        kv_heads = int(keys.shape[1])
+        head_dim = int(keys.shape[2])
+        key = (int(layer), str(keys.device), str(keys.dtype), kv_heads, head_dim)
+        pool = self._ensure_pool(key, keys, values, 1)
+        page_slots = pool["page_slots"]
+        if int(page.page_id) in page_slots:
+            slot = int(page_slots[int(page.page_id)])
+        else:
+            slot = int(pool["next_slot"])
+            page_slots[int(page.page_id)] = slot
+            pool["next_slot"] = slot + 1
+            pool = self._ensure_pool(key, keys, values, slot + 1)
+        pool["keys"][slot].zero_()
+        pool["values"][slot].zero_()
+        pool["keys"][slot, :, :token_count, :] = keys[:token_count].permute(1, 0, 2).contiguous()
+        pool["values"][slot, :, :token_count, :] = values[:token_count].permute(1, 0, 2).contiguous()
+        marker = self._resident.get(page.page_id)
+        if marker is not None:
+            marker["pool_key"] = key
+            marker["pool_slot"] = slot
+            marker["stored_tokens"] = token_count
+        self.pool_writes += 1
+
+    def pool_for_layer(
+        self,
+        layer: int,
+        *,
+        device: Any | None = None,
+        dtype: Any | None = None,
+        kv_heads: int | None = None,
+        head_dim: int | None = None,
+    ) -> dict[str, Any] | None:
+        device_name = str(device) if device is not None else None
+        dtype_name = str(dtype) if dtype is not None else None
+        candidates = []
+        for key, pool in self._pools.items():
+            pool_layer, pool_device, pool_dtype, pool_kv_heads, pool_head_dim = key
+            if pool_layer != int(layer):
+                continue
+            if device_name is not None and pool_device != device_name:
+                continue
+            if dtype_name is not None and pool_dtype != dtype_name:
+                continue
+            if kv_heads is not None and pool_kv_heads != int(kv_heads):
+                continue
+            if head_dim is not None and pool_head_dim != int(head_dim):
+                continue
+            candidates.append(pool)
+        if not candidates:
+            return None
+        return max(candidates, key=lambda item: int(item["keys"].shape[0]))
+
     def stats(self) -> dict[str, object]:
         return {
             "page_size": self.page_size,
@@ -143,6 +236,21 @@ class TorchKVPageAllocator:
             "released_pages": self.released_pages,
             "max_resident_pages": self.max_resident_pages,
             "spilled_pages": list(self.spilled_pages),
+            "pool_writes": self.pool_writes,
+            "pool_grows": self.pool_grows,
+            "persistent_pools": [
+                {
+                    "layer": key[0],
+                    "device": key[1],
+                    "dtype": key[2],
+                    "kv_heads": key[3],
+                    "head_dim": key[4],
+                    "slots": int(pool.get("next_slot", pool["keys"].shape[0])),
+                    "capacity": int(pool["keys"].shape[0]),
+                    "bytes": int(pool["keys"].numel() * pool["keys"].element_size() + pool["values"].numel() * pool["values"].element_size()),
+                }
+                for key, pool in sorted(self._pools.items(), key=lambda item: item[0])
+            ],
         }
 
     def _enforce_budget(self) -> None:
@@ -154,6 +262,32 @@ class TorchKVPageAllocator:
             marker["target"] = "cpu"
             marker["policy"] = "oldest-page"
             self.spilled_pages.append(marker)
+
+    def _ensure_pool(self, key: tuple[int, str, str, int, int], keys: Any, values: Any, capacity: int) -> dict[str, Any]:
+        capacity = max(1, int(capacity))
+        pool = self._pools.get(key)
+        if pool is None:
+            pool = {
+                "keys": keys.new_zeros((capacity, key[3], self.page_size, key[4])),
+                "values": values.new_zeros((capacity, key[3], self.page_size, key[4])),
+                "page_slots": {},
+                "next_slot": 0,
+            }
+            self._pools[key] = pool
+            self.pool_grows += 1
+            return pool
+        current = int(pool["keys"].shape[0])
+        if current >= capacity:
+            return pool
+        new_capacity = max(capacity, current * 2)
+        new_keys = keys.new_zeros((new_capacity, key[3], self.page_size, key[4]))
+        new_values = values.new_zeros((new_capacity, key[3], self.page_size, key[4]))
+        new_keys[:current] = pool["keys"]
+        new_values[:current] = pool["values"]
+        pool["keys"] = new_keys
+        pool["values"] = new_values
+        self.pool_grows += 1
+        return pool
 
 
 class TorchPagedKVCache:
@@ -196,6 +330,7 @@ class TorchPagedKVCache:
             cache.keys = self.torch.cat([cache.keys, keys.contiguous()], dim=1)
             cache.values = self.torch.cat([cache.values, values.contiguous()], dim=1)
         self._extend_pages(layer, cache, start, int(keys.shape[1]))
+        self._write_touched_pages(layer, cache, start, int(keys.shape[1]))
         return cache.keys, cache.values
 
     def snapshot_prefix(self, length: int) -> dict[int, tuple[np.ndarray, np.ndarray]]:
@@ -217,6 +352,7 @@ class TorchPagedKVCache:
             self.layers[layer] = cache
             self._extend_pages(layer, cache, 0, int(k_tensor.shape[1]))
             self._observe_page_bytes(k_tensor, v_tensor)
+            self._write_touched_pages(layer, cache, 0, int(k_tensor.shape[1]))
 
     def stats(self) -> dict[str, object]:
         return {
@@ -233,6 +369,29 @@ class TorchPagedKVCache:
             "allocator": self.allocator.stats(),
         }
 
+    def paged_view(self, layer: int) -> tuple[Any, Any, Any, int] | None:
+        cache = self.layers.get(layer)
+        if cache is None or cache.keys is None or cache.values is None or not cache.pages:
+            return None
+        kv_heads = int(cache.keys.shape[2])
+        head_dim = int(cache.keys.shape[3])
+        pool = self.allocator.pool_for_layer(
+            layer,
+            device=cache.keys.device,
+            dtype=cache.keys.dtype,
+            kv_heads=kv_heads,
+            head_dim=head_dim,
+        )
+        if pool is None:
+            return None
+        page_slots = pool.get("page_slots", {})
+        try:
+            page_ids = [int(page_slots[int(page.page_id)]) for page in cache.pages]
+        except KeyError:
+            return None
+        page_table = self.torch.as_tensor(page_ids, device=self.device, dtype=self.torch.int32)
+        return pool["keys"], pool["values"], page_table, cache.length
+
     def _extend_pages(self, layer: int, cache: _TorchLayerKVCache, start: int, length: int) -> None:
         remaining = length
         cursor = start
@@ -245,6 +404,19 @@ class TorchPagedKVCache:
                 cache.pages[-1].length += take
             cursor += take
             remaining -= take
+
+    def _write_touched_pages(self, layer: int, cache: _TorchLayerKVCache, start: int, length: int) -> None:
+        if cache.keys is None or cache.values is None or int(cache.keys.shape[0]) != 1:
+            return
+        end = int(start) + int(length)
+        for page in cache.pages:
+            page_start = int(page.start)
+            page_end = page_start + int(page.length)
+            if page_end <= start or page_start >= end:
+                continue
+            keys = cache.keys[0, page_start:page_end].contiguous()
+            values = cache.values[0, page_start:page_end].contiguous()
+            self.allocator.write_page(layer=layer, page=page, keys=keys, values=values)
 
     def _observe_page_bytes(self, keys: Any, values: Any) -> None:
         tokens = int(keys.shape[1]) if keys.ndim >= 2 else 0
@@ -278,8 +450,10 @@ class CudaRuntime:
         prefix_cache: PrefixCache | None = None,
         use_triton_elementwise: bool = True,
         use_triton_attention: bool = False,
+        use_triton_matmul: bool = False,
         packed_weights: dict[tuple[str, ...], Any] | None = None,
         kv_allocator: TorchKVPageAllocator | None = None,
+        memory_limit_mb: float | None = None,
     ):
         torch = _try_import_torch()
         if torch is None:
@@ -303,8 +477,12 @@ class CudaRuntime:
         self.prefix_cache = prefix_cache or PrefixCache(capacity=8)
         self.use_triton_elementwise = use_triton_elementwise
         self.use_triton_attention = use_triton_attention
+        self.use_triton_matmul = use_triton_matmul
+        self.memory_limit_mb = memory_limit_mb
         self._packed_weights = packed_weights if packed_weights is not None else {}
         self.kernel_counts: OrderedDict[str, int] = OrderedDict()
+        self.gemm_plans: OrderedDict[str, str] = OrderedDict()
+        self.oom_recoveries = 0
 
     @classmethod
     def available(cls) -> bool:
@@ -321,8 +499,10 @@ class CudaRuntime:
             prefix_cache=self.prefix_cache,
             use_triton_elementwise=self.use_triton_elementwise,
             use_triton_attention=self.use_triton_attention,
+            use_triton_matmul=self.use_triton_matmul,
             packed_weights=self._packed_weights,
             kv_allocator=self.kv_allocator,
+            memory_limit_mb=self.memory_limit_mb,
         )
 
     def run(
@@ -341,13 +521,19 @@ class CudaRuntime:
         if ids.ndim == 1:
             ids = ids[None, :]
         env: dict[str, Any] = {"input_ids": ids}
+        quantized_weight_names = _quantized_weight_inputs(graph)
         for name in graph.weights:
-            env[name] = self.weights.get(name)
+            env[name] = self.weights.get_quantized(name) if name in quantized_weight_names else self.weights.get(name)
         for name, value in graph.constants.items():
             env[name] = self.torch.as_tensor(value, device=self.device)
 
         for node in graph.nodes:
-            outputs = self._execute_node(graph, node, env, mode)
+            self._enforce_memory_limit()
+            try:
+                outputs = self._execute_node(graph, node, env, mode)
+            except self.torch.cuda.OutOfMemoryError as exc:
+                self._recover_from_oom()
+                raise RuntimeError("CacheIR CUDA runtime recovered from an out-of-memory condition; retry with a smaller batch/context") from exc
             for name, value in zip(node.outputs, outputs):
                 env[name] = value
         return env[graph.outputs[0]]
@@ -377,14 +563,20 @@ class CudaRuntime:
         graph = self.artifact.graph("decode")
         ids = self.torch.as_tensor([[int(token)] for token in token_ids], dtype=self.torch.long, device=self.device)
         env: dict[str, Any] = {"input_ids": ids}
+        quantized_weight_names = _quantized_weight_inputs(graph)
         for name in graph.weights:
-            env[name] = self.weights.get(name)
+            env[name] = self.weights.get_quantized(name) if name in quantized_weight_names else self.weights.get(name)
         for name, value in graph.constants.items():
             env[name] = self.torch.as_tensor(value, device=self.device)
 
         self._count_kernel("cacheir.cuda_decode_batch_graph")
         for node in graph.nodes:
-            outputs = self._execute_batch_node(graph, node, env, sessions)
+            self._enforce_memory_limit()
+            try:
+                outputs = self._execute_batch_node(graph, node, env, sessions)
+            except self.torch.cuda.OutOfMemoryError as exc:
+                self._recover_from_oom()
+                raise RuntimeError("CacheIR CUDA batch decode recovered from an out-of-memory condition; retry with fewer active requests") from exc
             for name, value in zip(node.outputs, outputs):
                 env[name] = value
         return env[graph.outputs[0]]
@@ -418,14 +610,20 @@ class CudaRuntime:
         padded = [list(tokens) + [0] * (max_seq - len(tokens)) for tokens in token_id_batches]
         ids = self.torch.as_tensor(padded, dtype=self.torch.long, device=self.device)
         env: dict[str, Any] = {"input_ids": ids}
+        quantized_weight_names = _quantized_weight_inputs(graph)
         for name in graph.weights:
-            env[name] = self.weights.get(name)
+            env[name] = self.weights.get_quantized(name) if name in quantized_weight_names else self.weights.get(name)
         for name, value in graph.constants.items():
             env[name] = self.torch.as_tensor(value, device=self.device)
 
         self._count_kernel("cacheir.cuda_prefill_batch_graph")
         for node in graph.nodes:
-            outputs = self._execute_batch_node(graph, node, env, sessions, seq_lens=seq_lens)
+            self._enforce_memory_limit()
+            try:
+                outputs = self._execute_batch_node(graph, node, env, sessions, seq_lens=seq_lens)
+            except self.torch.cuda.OutOfMemoryError as exc:
+                self._recover_from_oom()
+                raise RuntimeError("CacheIR CUDA batched prefill recovered from an out-of-memory condition; retry with fewer or shorter prompts") from exc
             for name, value in zip(node.outputs, outputs):
                 env[name] = value
         return env[graph.outputs[0]]
@@ -486,11 +684,34 @@ class CudaRuntime:
         stats = self.kv_cache.stats()
         stats["prefix_cache"] = self.prefix_cache.stats()
         stats["kernel_counts"] = dict(self.kernel_counts)
+        stats["gemm_plans"] = dict(self.gemm_plans)
+        stats["oom_recoveries"] = self.oom_recoveries
+        stats["memory_limit_mb"] = self.memory_limit_mb
         return stats
 
     def synchronize(self) -> None:
         if self.device.type == "cuda":
             self.torch.cuda.synchronize(self.device)
+
+    def _enforce_memory_limit(self) -> None:
+        if self.memory_limit_mb is None or self.device.type != "cuda":
+            return
+        allocated_mb = float(self.torch.cuda.memory_allocated(self.device)) / (1024.0 * 1024.0)
+        if allocated_mb <= float(self.memory_limit_mb):
+            return
+        self._recover_from_oom()
+        allocated_after_mb = float(self.torch.cuda.memory_allocated(self.device)) / (1024.0 * 1024.0)
+        if allocated_after_mb > float(self.memory_limit_mb):
+            raise RuntimeError(
+                f"CacheIR CUDA memory limit exceeded: {allocated_after_mb:.1f} MB allocated after recovery, "
+                f"limit is {float(self.memory_limit_mb):.1f} MB"
+            )
+
+    def _recover_from_oom(self) -> None:
+        self.oom_recoveries += 1
+        self.kv_cache.clear()
+        if self.device.type == "cuda":
+            self.torch.cuda.empty_cache()
 
     def _execute_node(self, graph: Graph, node: Node, env: dict[str, Any], mode: str) -> list[Any]:
         op = node.op
@@ -498,12 +719,14 @@ class CudaRuntime:
             return [env[node.inputs[1]][env[node.inputs[0]]]]
         if op == "rms_norm":
             return [self._rms_norm(env[node.inputs[0]], env[node.inputs[1]], float(node.attrs.get("eps", 1e-6)))]
-        if op in {"matmul", "quantized_matmul"}:
+        if op == "matmul":
             return [self._matmul(env[node.inputs[0]], env[node.inputs[1]])]
+        if op == "quantized_matmul":
+            return [self._quantized_matmul(env[node.inputs[0]], env[node.inputs[1]])]
         if op == "qkv_projection":
             x = env[node.inputs[0]]
             return [self._matmul(x, env[node.inputs[1]]), self._matmul(x, env[node.inputs[2]]), self._matmul(x, env[node.inputs[3]])]
-        if op in {"fused_rmsnorm_qkv_rope", "quantized_fused_rmsnorm_qkv_rope"}:
+        if op == "fused_rmsnorm_qkv_rope":
             x = self._rms_norm(env[node.inputs[0]], env[node.inputs[1]], float(node.attrs.get("eps", 1e-6)))
             q_weight = env[node.inputs[2]]
             k_weight = env[node.inputs[3]]
@@ -511,6 +734,14 @@ class CudaRuntime:
             packed = self._packed_weight(tuple(node.inputs[2:5]), [q_weight, k_weight, v_weight])
             qkv = self._matmul(x, packed, kernel_name="torch.matmul.qkv_packed")
             q, k, v = self.torch.split(qkv, [int(q_weight.shape[0]), int(k_weight.shape[0]), int(v_weight.shape[0])], dim=-1)
+            layer = int(node.attrs.get("layer", 0))
+            q, k = self._rope(q, k, node.attrs, self._position_offset(layer))
+            return [q, k, v]
+        if op == "quantized_fused_rmsnorm_qkv_rope":
+            x = self._rms_norm(env[node.inputs[0]], env[node.inputs[1]], float(node.attrs.get("eps", 1e-6)))
+            q = self._quantized_matmul(x, env[node.inputs[2]])
+            k = self._quantized_matmul(x, env[node.inputs[3]])
+            v = self._quantized_matmul(x, env[node.inputs[4]])
             layer = int(node.attrs.get("layer", 0))
             q, k = self._rope(q, k, node.attrs, self._position_offset(layer))
             return [q, k, v]
@@ -528,13 +759,18 @@ class CudaRuntime:
             return [self.torch.sigmoid(env[node.inputs[0]])]
         if op == "elementwise_mul":
             return [env[node.inputs[0]] * env[node.inputs[1]]]
-        if op in {"fused_swiglu", "quantized_fused_swiglu"}:
+        if op == "fused_swiglu":
             x = env[node.inputs[0]]
             gate_weight = env[node.inputs[1]]
             up_weight = env[node.inputs[2]]
             packed = self._packed_weight(tuple(node.inputs[1:3]), [gate_weight, up_weight])
             gate_up = self._matmul(x, packed, kernel_name="torch.matmul.swiglu_packed")
             gate, up = self.torch.split(gate_up, [int(gate_weight.shape[0]), int(up_weight.shape[0])], dim=-1)
+            return [self._silu_mul(gate, up)]
+        if op == "quantized_fused_swiglu":
+            x = env[node.inputs[0]]
+            gate = self._quantized_matmul(x, env[node.inputs[1]])
+            up = self._quantized_matmul(x, env[node.inputs[2]])
             return [self._silu_mul(gate, up)]
         if op == "softmax":
             return [self.torch.softmax(env[node.inputs[0]], dim=-1)]
@@ -554,12 +790,14 @@ class CudaRuntime:
             return [env[node.inputs[1]][env[node.inputs[0]]]]
         if op == "rms_norm":
             return [self._rms_norm(env[node.inputs[0]], env[node.inputs[1]], float(node.attrs.get("eps", 1e-6)))]
-        if op in {"matmul", "quantized_matmul"}:
+        if op == "matmul":
             return [self._matmul(env[node.inputs[0]], env[node.inputs[1]])]
+        if op == "quantized_matmul":
+            return [self._quantized_matmul(env[node.inputs[0]], env[node.inputs[1]])]
         if op == "qkv_projection":
             x = env[node.inputs[0]]
             return [self._matmul(x, env[node.inputs[1]]), self._matmul(x, env[node.inputs[2]]), self._matmul(x, env[node.inputs[3]])]
-        if op in {"fused_rmsnorm_qkv_rope", "quantized_fused_rmsnorm_qkv_rope"}:
+        if op == "fused_rmsnorm_qkv_rope":
             x = self._rms_norm(env[node.inputs[0]], env[node.inputs[1]], float(node.attrs.get("eps", 1e-6)))
             q_weight = env[node.inputs[2]]
             k_weight = env[node.inputs[3]]
@@ -567,6 +805,15 @@ class CudaRuntime:
             packed = self._packed_weight(tuple(node.inputs[2:5]), [q_weight, k_weight, v_weight])
             qkv = self._matmul(x, packed, kernel_name="torch.matmul.qkv_packed.batch")
             q, k, v = self.torch.split(qkv, [int(q_weight.shape[0]), int(k_weight.shape[0]), int(v_weight.shape[0])], dim=-1)
+            layer = int(node.attrs.get("layer", 0))
+            offsets = [session._position_offset(layer) for session in sessions]
+            q, k = self._rope_with_offsets(q, k, node.attrs, offsets)
+            return [q, k, v]
+        if op == "quantized_fused_rmsnorm_qkv_rope":
+            x = self._rms_norm(env[node.inputs[0]], env[node.inputs[1]], float(node.attrs.get("eps", 1e-6)))
+            q = self._quantized_matmul(x, env[node.inputs[2]])
+            k = self._quantized_matmul(x, env[node.inputs[3]])
+            v = self._quantized_matmul(x, env[node.inputs[4]])
             layer = int(node.attrs.get("layer", 0))
             offsets = [session._position_offset(layer) for session in sessions]
             q, k = self._rope_with_offsets(q, k, node.attrs, offsets)
@@ -609,13 +856,18 @@ class CudaRuntime:
             return [self.torch.sigmoid(env[node.inputs[0]])]
         if op == "elementwise_mul":
             return [env[node.inputs[0]] * env[node.inputs[1]]]
-        if op in {"fused_swiglu", "quantized_fused_swiglu"}:
+        if op == "fused_swiglu":
             x = env[node.inputs[0]]
             gate_weight = env[node.inputs[1]]
             up_weight = env[node.inputs[2]]
             packed = self._packed_weight(tuple(node.inputs[1:3]), [gate_weight, up_weight])
             gate_up = self._matmul(x, packed, kernel_name="torch.matmul.swiglu_packed.batch")
             gate, up = self.torch.split(gate_up, [int(gate_weight.shape[0]), int(up_weight.shape[0])], dim=-1)
+            return [self._silu_mul(gate, up)]
+        if op == "quantized_fused_swiglu":
+            x = env[node.inputs[0]]
+            gate = self._quantized_matmul(x, env[node.inputs[1]])
+            up = self._quantized_matmul(x, env[node.inputs[2]])
             return [self._silu_mul(gate, up)]
         if op == "softmax":
             return [self.torch.softmax(env[node.inputs[0]], dim=-1)]
@@ -666,8 +918,101 @@ class CudaRuntime:
         return out.reshape_as(x)
 
     def _matmul(self, x: Any, weight: Any, *, kernel_name: str = "torch.matmul") -> Any:
-        self._count_kernel(kernel_name)
+        if isinstance(weight, CudaPackedQuantizedTensor):
+            return self._quantized_matmul(x, weight)
+        plan = self._select_gemm_plan(x, weight, requested=kernel_name)
+        if plan == "triton.matmul_f16":
+            triton_result = self._try_triton_matmul(x, weight)
+            if triton_result is not None:
+                self._count_kernel(plan)
+                return triton_result
+        self._count_kernel(plan)
         return self.torch.matmul(x, weight.t())
+
+    def _quantized_matmul(self, x: Any, weight: CudaPackedQuantizedTensor | Any) -> Any:
+        if not isinstance(weight, CudaPackedQuantizedTensor):
+            return self._matmul(x, weight)
+        dense = self._dequantize_cuda_weight(weight).to(dtype=x.dtype if x.dtype in {self.torch.float16, self.torch.bfloat16, self.torch.float32} else self.dtype)
+        plan = f"cacheir.qgemm.int{weight.bits}.dequant_matmul"
+        self.gemm_plans[f"q{weight.bits}:{tuple(int(dim) for dim in x.shape)}x{weight.shape}"] = plan
+        self._count_kernel(plan)
+        return self.torch.matmul(x, dense.t())
+
+    def _dequantize_cuda_weight(self, weight: CudaPackedQuantizedTensor) -> Any:
+        rows, cols = weight.shape
+        if weight.bits == 8:
+            qvalues = weight.packed_values.to(self.torch.float32)
+        elif weight.bits == 4:
+            packed = weight.packed_values
+            padded_cols = int(packed.shape[1]) * 2
+            qvalues = self.torch.empty((rows, padded_cols), device=packed.device, dtype=self.torch.float32)
+            qvalues[:, 0::2] = (packed & 0x0F).to(self.torch.float32)
+            qvalues[:, 1::2] = ((packed >> 4) & 0x0F).to(self.torch.float32)
+            qvalues = qvalues[:, :cols]
+        else:
+            raise ValueError(f"Unsupported CUDA packed quantization bit width {weight.bits}")
+        return (qvalues - weight.zero_points[:, None]) * weight.scales[:, None]
+
+    def _select_gemm_plan(self, x: Any, weight: Any, *, requested: str) -> str:
+        if requested != "torch.matmul":
+            self.gemm_plans[f"{requested}:{tuple(int(dim) for dim in x.shape)}x{tuple(int(dim) for dim in weight.shape)}"] = requested
+            return requested
+        if (
+            self.use_triton_matmul
+            and getattr(x, "is_cuda", False)
+            and x.dtype is self.torch.float16
+            and weight.dtype is self.torch.float16
+            and int(x.shape[-1]) >= 16
+            and int(weight.shape[0]) >= 16
+        ):
+            plan = "triton.matmul_f16"
+        elif getattr(x, "is_cuda", False):
+            plan = "cublaslt.torch.matmul"
+        else:
+            plan = "torch.matmul"
+        self.gemm_plans[f"{tuple(int(dim) for dim in x.shape)}x{tuple(int(dim) for dim in weight.shape)}"] = plan
+        return plan
+
+    def _try_triton_matmul(self, x: Any, weight: Any) -> Any | None:
+        try:
+            import cacheir.backends.triton_kernels as tk
+        except Exception:
+            return None
+        if not tk.triton_available() or tk.matmul_f16_kernel is None:
+            return None
+        if x.ndim < 2 or weight.ndim != 2:
+            return None
+        k_dim = int(x.shape[-1])
+        out_features = int(weight.shape[0])
+        flat = x.reshape(-1, k_dim).contiguous()
+        if int(flat.shape[0]) == 0:
+            return None
+        if k_dim % 16 or out_features % 16:
+            return None
+        b = weight.t().contiguous()
+        out = self.torch.empty((int(flat.shape[0]), out_features), device=x.device, dtype=self.torch.float32)
+        block_m = 16 if int(flat.shape[0]) < 64 else 32
+        block_n = 16 if out_features < 64 else 32
+        block_k = 32 if k_dim >= 32 else 16
+        grid = (int(tk.triton.cdiv(flat.shape[0], block_m)), int(tk.triton.cdiv(out_features, block_n)))
+        tk.matmul_f16_kernel[grid](
+            flat,
+            b,
+            out,
+            m=int(flat.shape[0]),
+            n=out_features,
+            k=k_dim,
+            stride_am=flat.stride(0),
+            stride_ak=flat.stride(1),
+            stride_bk=b.stride(0),
+            stride_bn=b.stride(1),
+            stride_om=out.stride(0),
+            stride_on=out.stride(1),
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            BLOCK_K=block_k,
+        )
+        return out.reshape(*x.shape[:-1], out_features).to(dtype=x.dtype)
 
     def _packed_weight(self, key: tuple[str, ...], tensors: list[Any]) -> Any:
         cached = self._packed_weights.get(key)
@@ -768,7 +1113,7 @@ class CudaRuntime:
         kh, vh = self.kv_cache.append(layer, kh_new, vh_new)
 
         if self.use_triton_attention and mode == "decode" and batch == 1 and q_len == 1:
-            decoded = self._try_triton_decode_attention(qh, kh, vh, heads, kv_heads, head_dim)
+            decoded = self._try_triton_decode_attention(layer, qh, heads, kv_heads, head_dim)
             if decoded is not None:
                 return decoded
 
@@ -797,27 +1142,25 @@ class CudaRuntime:
         self._count_kernel("torch.sdpa_attention")
         return ctx.transpose(1, 2).reshape(batch, q_len, heads * head_dim)
 
-    def _try_triton_decode_attention(self, qh: Any, kh: Any, vh: Any, heads: int, kv_heads: int, head_dim: int) -> Any | None:
+    def _try_triton_decode_attention(self, layer: int, qh: Any, heads: int, kv_heads: int, head_dim: int) -> Any | None:
         try:
             import cacheir.backends.triton_kernels as tk
         except Exception:
             return None
         if not tk.triton_available() or tk.paged_attention_decode_batch_kernel is None:
             return None
-        seq_len = int(kh.shape[1])
         block = int(tk.triton.next_power_of_2(head_dim))
         if block > 256:
             return None
+        view = self.kv_cache.paged_view(layer)
+        if view is None:
+            return None
+        k_pages, v_pages, page_table_1d, seq_len = view
+        max_pages = int(page_table_1d.numel())
+        if max_pages <= 0:
+            return None
         page_size = self.kv_cache.page_size
-        max_pages = int(np.ceil(seq_len / page_size))
-        padded_tokens = max_pages * page_size
-        k_pad = self.torch.zeros((padded_tokens, kv_heads, head_dim), device=self.device, dtype=kh.dtype)
-        v_pad = self.torch.zeros_like(k_pad)
-        k_pad[:seq_len] = kh[0]
-        v_pad[:seq_len] = vh[0]
-        k_pages = k_pad.reshape(max_pages, page_size, kv_heads, head_dim).permute(0, 2, 1, 3).contiguous()
-        v_pages = v_pad.reshape(max_pages, page_size, kv_heads, head_dim).permute(0, 2, 1, 3).contiguous()
-        page_table = self.torch.arange(max_pages, device=self.device, dtype=self.torch.int32)[None, :]
+        page_table = page_table_1d.reshape(1, max_pages).contiguous()
         seq_lens = self.torch.tensor([seq_len], device=self.device, dtype=self.torch.int32)
         out = self.torch.empty((1, heads, head_dim), device=self.device, dtype=qh.dtype)
         tk.paged_attention_decode_batch_kernel[(heads, 1)](
@@ -834,7 +1177,7 @@ class CudaRuntime:
             head_dim=head_dim,
             BLOCK=block,
         )
-        self._count_kernel("triton.paged_attention_decode_batch")
+        self._count_kernel("triton.paged_attention_decode_batch.persistent")
         return out.reshape(1, 1, heads * head_dim)
 
     def _try_triton_decode_attention_batch(
@@ -869,32 +1212,26 @@ class CudaRuntime:
         kh_new = k.reshape(batch, int(k.shape[1]), kv_heads, head_dim)
         vh_new = v.reshape(batch, int(v.shape[1]), kv_heads, head_dim)
 
-        caches = []
+        views = []
         seq_lens = []
         for idx, session in enumerate(sessions):
-            kh, vh = session.kv_cache.append(layer, kh_new[idx : idx + 1], vh_new[idx : idx + 1])
-            caches.append((kh[0], vh[0]))
-            seq_lens.append(int(kh.shape[1]))
+            session.kv_cache.append(layer, kh_new[idx : idx + 1], vh_new[idx : idx + 1])
+            view = session.kv_cache.paged_view(layer)
+            if view is None:
+                return None
+            views.append(view)
+            seq_lens.append(int(view[3]))
 
         page_size = sessions[0].kv_cache.page_size
-        max_pages = max(1, max(int(np.ceil(length / page_size)) for length in seq_lens))
-        total_pages = batch * max_pages
-        k_pages = self.torch.zeros((total_pages, kv_heads, page_size, head_dim), device=self.device, dtype=q.dtype)
-        v_pages = self.torch.zeros_like(k_pages)
-        page_table = self.torch.empty((batch, max_pages), device=self.device, dtype=self.torch.int32)
-
-        for idx, (kh, vh) in enumerate(caches):
-            seq_len = seq_lens[idx]
-            padded_tokens = max_pages * page_size
-            k_pad = self.torch.zeros((padded_tokens, kv_heads, head_dim), device=self.device, dtype=kh.dtype)
-            v_pad = self.torch.zeros_like(k_pad)
-            k_pad[:seq_len] = kh[:seq_len]
-            v_pad[:seq_len] = vh[:seq_len]
-            page_start = idx * max_pages
-            page_stop = page_start + max_pages
-            k_pages[page_start:page_stop] = k_pad.reshape(max_pages, page_size, kv_heads, head_dim).permute(0, 2, 1, 3).contiguous()
-            v_pages[page_start:page_stop] = v_pad.reshape(max_pages, page_size, kv_heads, head_dim).permute(0, 2, 1, 3).contiguous()
-            page_table[idx] = self.torch.arange(page_start, page_stop, device=self.device, dtype=self.torch.int32)
+        k_pages = views[0][0]
+        v_pages = views[0][1]
+        if any(view[0] is not k_pages or view[1] is not v_pages for view in views):
+            return None
+        max_pages = max(1, max(int(view[2].numel()) for view in views))
+        page_table = self.torch.zeros((batch, max_pages), device=self.device, dtype=self.torch.int32)
+        for idx, view in enumerate(views):
+            page_ids = view[2]
+            page_table[idx, : int(page_ids.numel())] = page_ids
 
         seq_lens_tensor = self.torch.as_tensor(seq_lens, device=self.device, dtype=self.torch.int32)
         out = self.torch.empty((batch, heads, head_dim), device=self.device, dtype=q.dtype)
@@ -912,7 +1249,7 @@ class CudaRuntime:
             head_dim=head_dim,
             BLOCK=block,
         )
-        self._count_kernel("triton.paged_attention_decode_batch.shared")
+        self._count_kernel("triton.paged_attention_decode_batch.persistent_shared")
         return out.reshape(batch, 1, heads * head_dim)
 
     def _count_kernel(self, name: str) -> None:

@@ -8,7 +8,7 @@ import numpy as np
 
 import cacheir.backends.native as native
 from cacheir.importers.gguf import GGUFReader
-from cacheir.quantization import quantize_dequantize
+from cacheir.quantization import PackedQuantizedTensor, dequantize_packed_weight, pack_quantized_weight, quantize_dequantize
 from cacheir.ir import Graph, Node, WeightSpec
 from cacheir.runtime.artifact import CompileArtifact
 from cacheir.runtime.kv_cache import PagedKVCache, PrefixCache, SpilloverCostModel, SpilloverPolicy
@@ -23,6 +23,7 @@ class WeightStore:
         self._npz: dict[str, np.ndarray] | None = None
         self._gguf: GGUFReader | None = None
         self._cache: dict[str, np.ndarray] = {}
+        self._qcache: dict[str, PackedQuantizedTensor] = {}
 
     def get(self, value_name: str) -> np.ndarray:
         spec = self.specs[value_name]
@@ -31,39 +32,50 @@ class WeightStore:
         tensor = self._load_by_key(spec)
         tensor = tensor.astype(np.float32, copy=False)
         if self.quant and tensor.ndim == 2:
-            tensor = quantize_dequantize(tensor, self.quant)
+            tensor = dequantize_packed_weight(self._pack_value(value_name, tensor))
         self._cache[value_name] = tensor
         return self._cache[value_name]
+
+    def get_quantized(self, value_name: str) -> PackedQuantizedTensor:
+        if value_name in self._qcache:
+            return self._qcache[value_name]
+        spec = self.specs[value_name]
+        tensor = self._load_by_key(spec).astype(np.float32, copy=False)
+        if tensor.ndim != 2:
+            raise ValueError(f"Weight {value_name!r} is not a 2D matrix and cannot be packed")
+        return self._pack_value(value_name, tensor)
+
+    def _pack_value(self, value_name: str, tensor: np.ndarray) -> PackedQuantizedTensor:
+        if value_name in self._qcache:
+            return self._qcache[value_name]
+        packed = pack_quantized_weight(tensor, self.quant)
+        if packed is None:
+            tensor = quantize_dequantize(tensor, self.quant)
+            packed = pack_quantized_weight(tensor, "int8")
+            if packed is None:
+                raise ValueError(f"Unsupported quantization mode {self.quant!r}")
+        self._qcache[value_name] = packed
+        return packed
 
     def _load_by_key(self, spec: WeightSpec) -> np.ndarray:
         if self.model_path.is_file() and self.model_path.suffix == ".npz":
             return np.load(self.model_path)[spec.key]
         if self.model_path.is_file() and self.model_path.suffix == ".safetensors":
-            try:
-                from safetensors import safe_open
-            except ImportError as exc:
-                raise RuntimeError("safetensors runtime loading requires the optional 'safetensors' dependency") from exc
-            with safe_open(self.model_path, framework="np") as handle:
-                return handle.get_tensor(spec.key)
+            return _load_safetensor_tensor(self.model_path, spec.key)
         if self.model_path.is_file() and self.model_path.suffix == ".gguf":
             if self._gguf is None:
                 self._gguf = GGUFReader(self.model_path)
             return self._gguf.read_tensor(spec.key)
         if self.model_path.is_dir():
             npz_path = self.model_path / (spec.file or "weights.npz")
-            if npz_path.exists():
+            if npz_path.exists() and npz_path.suffix == ".npz":
                 if self._npz is None:
                     with np.load(npz_path) as data:
                         self._npz = {key: data[key] for key in data.files}
                 return self._npz[spec.key]
             safetensor_path = self.model_path / spec.file if spec.file else None
             if safetensor_path and safetensor_path.exists():
-                try:
-                    from safetensors import safe_open
-                except ImportError as exc:
-                    raise RuntimeError("safetensors runtime loading requires the optional 'safetensors' dependency") from exc
-                with safe_open(safetensor_path, framework="np") as handle:
-                    return handle.get_tensor(spec.key)
+                return _load_safetensor_tensor(safetensor_path, spec.key)
         raise FileNotFoundError(f"Could not load weight {spec.key!r} from {self.model_path}")
 
 
@@ -112,8 +124,12 @@ class Runtime:
         if ids.ndim == 1:
             ids = ids[None, :]
         env: dict[str, np.ndarray] = {"input_ids": ids}
+        quantized_weight_names = _quantized_weight_inputs(graph)
         for name in graph.weights:
-            env[name] = self.weights.get(name)
+            if name in quantized_weight_names:
+                env[name] = self.weights.get_quantized(name)  # type: ignore[assignment]
+            else:
+                env[name] = self.weights.get(name)
         for name, value in graph.constants.items():
             env[name] = np.asarray(value)
 
@@ -208,16 +224,26 @@ class Runtime:
             return [env[node.inputs[1]][env[node.inputs[0]]]]
         if op == "rms_norm":
             return [self._rms_norm(env[node.inputs[0]], env[node.inputs[1]], float(node.attrs.get("eps", 1e-6)))]
-        if op in {"matmul", "quantized_matmul"}:
+        if op == "matmul":
             return [self._matmul(env[node.inputs[0]], env[node.inputs[1]])]
+        if op == "quantized_matmul":
+            return [self._quantized_matmul(env[node.inputs[0]], env[node.inputs[1]])]
         if op in {"qkv_projection"}:
             x = env[node.inputs[0]]
             return [self._matmul(x, env[node.inputs[1]]), self._matmul(x, env[node.inputs[2]]), self._matmul(x, env[node.inputs[3]])]
-        if op in {"fused_rmsnorm_qkv_rope", "quantized_fused_rmsnorm_qkv_rope"}:
+        if op == "fused_rmsnorm_qkv_rope":
             x = self._rms_norm(env[node.inputs[0]], env[node.inputs[1]], float(node.attrs.get("eps", 1e-6)))
             q = self._matmul(x, env[node.inputs[2]])
             k = self._matmul(x, env[node.inputs[3]])
             v = self._matmul(x, env[node.inputs[4]])
+            layer = int(node.attrs.get("layer", 0))
+            q, k = self._rope(q, k, node.attrs, self._position_offset(layer, mode))
+            return [q, k, v]
+        if op == "quantized_fused_rmsnorm_qkv_rope":
+            x = self._rms_norm(env[node.inputs[0]], env[node.inputs[1]], float(node.attrs.get("eps", 1e-6)))
+            q = self._quantized_matmul(x, env[node.inputs[2]])
+            k = self._quantized_matmul(x, env[node.inputs[3]])
+            v = self._quantized_matmul(x, env[node.inputs[4]])
             layer = int(node.attrs.get("layer", 0))
             q, k = self._rope(q, k, node.attrs, self._position_offset(layer, mode))
             return [q, k, v]
@@ -237,10 +263,17 @@ class Runtime:
             return [1.0 / (1.0 + np.exp(-x))]
         if op == "elementwise_mul":
             return [env[node.inputs[0]] * env[node.inputs[1]]]
-        if op in {"fused_swiglu", "quantized_fused_swiglu"}:
+        if op == "fused_swiglu":
             x = env[node.inputs[0]]
             gate = self._matmul(x, env[node.inputs[1]])
             up = self._matmul(x, env[node.inputs[2]])
+            if native.available() and hasattr(native, "silu_mul") and gate.dtype == np.float32 and up.dtype == np.float32:
+                return [native.silu_mul(gate, up)]
+            return [(gate / (1.0 + np.exp(-gate))) * up]
+        if op == "quantized_fused_swiglu":
+            x = env[node.inputs[0]]
+            gate = self._quantized_matmul(x, env[node.inputs[1]])
+            up = self._quantized_matmul(x, env[node.inputs[2]])
             if native.available() and hasattr(native, "silu_mul") and gate.dtype == np.float32 and up.dtype == np.float32:
                 return [native.silu_mul(gate, up)]
             return [(gate / (1.0 + np.exp(-gate))) * up]
@@ -257,6 +290,8 @@ class Runtime:
 
     @staticmethod
     def _matmul(x: np.ndarray, weight: np.ndarray) -> np.ndarray:
+        if isinstance(weight, PackedQuantizedTensor):
+            return Runtime._quantized_matmul(x, weight)
         policy = os.environ.get("CACHEIR_NATIVE_MATMUL", "numpy").lower()
         use_native = policy in {"1", "true", "force"}
         if policy == "auto" and x.ndim == 3:
@@ -267,6 +302,14 @@ class Runtime:
         if use_native and native.available() and x.ndim == 3 and x.dtype == np.float32 and weight.dtype == np.float32:
             return native.matmul_out_in(x, weight)
         return np.einsum("...i,oi->...o", x, weight, optimize=True)
+
+    @staticmethod
+    def _quantized_matmul(x: np.ndarray, weight: PackedQuantizedTensor | np.ndarray) -> np.ndarray:
+        if isinstance(weight, PackedQuantizedTensor):
+            dense = dequantize_packed_weight(weight)
+        else:
+            dense = weight
+        return Runtime._matmul(x, dense.astype(np.float32, copy=False))
 
     def _position_offset(self, layer: int, mode: str) -> int:
         if layer in self.kv_cache:
@@ -336,3 +379,32 @@ class Runtime:
 
 def math_sqrt(value: int) -> float:
     return float(np.sqrt(float(value)))
+
+
+def _load_safetensor_tensor(path: Path, key: str) -> np.ndarray:
+    try:
+        from safetensors import safe_open
+    except ImportError as exc:
+        raise RuntimeError("safetensors runtime loading requires the optional 'safetensors' dependency") from exc
+    try:
+        with safe_open(path, framework="np") as handle:
+            return handle.get_tensor(key)
+    except TypeError:
+        try:
+            with safe_open(path, framework="pt") as handle:
+                tensor = handle.get_tensor(key)
+        except ImportError as exc:
+            raise RuntimeError("Loading BF16 safetensors requires PyTorch") from exc
+        return tensor.detach().cpu().float().numpy()
+
+
+def _quantized_weight_inputs(graph: Graph) -> set[str]:
+    names: set[str] = set()
+    for node in graph.nodes:
+        if node.op == "quantized_matmul" and len(node.inputs) >= 2:
+            names.add(node.inputs[1])
+        elif node.op == "quantized_fused_rmsnorm_qkv_rope" and len(node.inputs) >= 5:
+            names.update(node.inputs[2:5])
+        elif node.op == "quantized_fused_swiglu" and len(node.inputs) >= 3:
+            names.update(node.inputs[1:3])
+    return names

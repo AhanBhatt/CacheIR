@@ -2,6 +2,7 @@ import json
 
 import numpy as np
 
+from cacheir.quantization import dequantize_packed_weight, pack_quantized_weight
 from cacheir import Runtime, compile_model
 from cacheir.benchmark import run_benchmark
 from cacheir.hardware import profile_hardware
@@ -63,3 +64,19 @@ def test_quantized_runtime_path(tmp_path):
     logits = runtime.run([[1, 2, 3]], mode="prefill")
     assert logits.shape == (1, 3, 32)
     assert np.isfinite(logits).all()
+    packed = runtime.weights.get_quantized("layer0_q_w")
+    assert packed.bits == 4
+    assert packed.packed_values.dtype == np.uint8
+    assert packed.packed_values.nbytes < np.prod(packed.shape) * 4
+
+
+def test_packed_int4_and_int8_quantization_roundtrip():
+    weight = np.linspace(-1.5, 2.0, num=30, dtype=np.float32).reshape(3, 10)
+    q4 = pack_quantized_weight(weight, "int4_awq")
+    q8 = pack_quantized_weight(weight, "int8")
+    assert q4 is not None and q8 is not None
+    assert q4.packed_values.shape == (3, 5)
+    assert q8.packed_values.shape == weight.shape
+    assert q4.zero_points.shape == (3,)
+    assert q4.compression_ratio > 1.0
+    np.testing.assert_allclose(dequantize_packed_weight(q8), weight, rtol=0.02, atol=0.02)

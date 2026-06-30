@@ -82,6 +82,22 @@ def probe_external_systems() -> dict[str, ExternalSystemStatus]:
             capability="GGUF benchmark comparison",
             notes="CacheIR can run llama-bench when the standalone executable is on PATH.",
         ),
+        "tensorrt_llm": ExternalSystemStatus(
+            name="tensorrt_llm",
+            available=_has_module("tensorrt_llm") or bool(shutil.which("trtllm-bench")),
+            module="tensorrt_llm" if _has_module("tensorrt_llm") else None,
+            command=shutil.which("trtllm-bench"),
+            capability="TensorRT-LLM throughput/latency benchmark comparison",
+            notes="CacheIR records availability and can run user-supplied trtllm-bench commands through the comparison script.",
+        ),
+        "mlc_llm": ExternalSystemStatus(
+            name="mlc_llm",
+            available=_has_module("mlc_llm") or bool(shutil.which("mlc_llm")),
+            module="mlc_llm" if _has_module("mlc_llm") else None,
+            command=shutil.which("mlc_llm"),
+            capability="MLC LLM benchmark comparison",
+            notes="CacheIR records availability and can run user-supplied mlc_llm commands through the comparison script.",
+        ),
         "iree": ExternalSystemStatus(
             name="iree",
             available=iree_available,
@@ -414,6 +430,8 @@ def run_installed_upstream_benchmarks(
     benchmarks["llama.cpp"] = (
         run_llama_cpp_benchmark(llama_model) if llama_model and statuses["llama.cpp"].available else statuses["llama.cpp"].to_dict()
     )
+    benchmarks["tensorrt_llm"] = statuses["tensorrt_llm"].to_dict()
+    benchmarks["mlc_llm"] = statuses["mlc_llm"].to_dict()
     return {"systems": {name: status.to_dict() for name, status in statuses.items()}, "benchmarks": benchmarks}
 
 

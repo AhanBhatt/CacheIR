@@ -1,6 +1,6 @@
 # CacheIR Benchmark, Performance, and Result Report
 
-Date: 2026-06-25
+Date: 2026-06-29
 
 ## Executive Summary
 
@@ -31,9 +31,11 @@ The vLLM CUDA comparison path is runnable again. Two local blockers were fixed:
   CacheIR-launched vLLM benchmarks.
 
 This improves CacheIR substantially as an explainable compiler/runtime project.
-The remaining work is concrete systems work: packed quantized GEMM, a true
-page-backed shared GPU paged KV allocator used directly by fused attention
-kernels, tuned GEMM selection, and large-model benchmark evidence.
+The latest pass adds persistent page-backed shared GPU KV pools consumed directly
+by Triton paged decode kernels, packed int4/int8 loader integration, shape-aware
+GEMM plan selection, scheduler hardening, BF16 safetensors support, Qwen2.5-0.5B
+CUDA execution, and real vLLM/llama.cpp comparison runs where those systems are
+installed locally.
 
 ## Environment
 
@@ -282,10 +284,31 @@ Artifacts:
 
 Interpretation: h1024/l4 improves by 1.71x in latency and generated-token
 throughput. h2048/l4 improves by 1.27x because prefill dominates the short
-8-token run and attention still splits per request after padded dense work. This
-is real scheduler-level CUDA batching with variable-length prefill, but it is
-still short of production LLM serving because the fused attention path does not
-yet consume a persistent page-backed shared GPU KV pool.
+8-token run.
+
+Post-production persistent page-pool rerun:
+
+```bash
+python scripts/benchmark_cuda_scheduler.py \
+  --output .tmp/reports/cuda_scheduler_benchmark_persistent_post_production.json \
+  --repeats 2 \
+  --warmup 1 \
+  --max-batch-size 4 \
+  --max-new-tokens 8 \
+  --hidden-size 512 \
+  --num-layers 2 \
+  --cuda-dtype float16 \
+  --use-triton-attention
+```
+
+| Shape | Mode | Median elapsed ms | Generated tok/s | Evidence |
+| --- | --- | ---: | ---: | --- |
+| h512, 2 layers, batch 4 | Sequential CUDA sessions | 176.225 | 184.0 | Persistent pools allocated, no batched decode |
+| h512, 2 layers, batch 4 | Batched persistent paged decode | 78.491 | 407.8 | 8 batched decode rounds, 32 batched decode tokens |
+
+The persistent rerun improves latency by 2.25x and generated-token throughput by
+2.22x. CacheIR now uses persistent page-backed CUDA KV pools directly from the
+Triton paged decode kernels instead of repacking K/V tensors per request.
 
 ## Upstream Benchmarks
 
@@ -338,35 +361,49 @@ FlashInfer JIT costs dominate. vLLM's advantages appear on realistic model
 sizes, larger batches, continuous batching, longer contexts, and optimized graph
 capture paths.
 
+WSL2 CUDA Qwen2.5-0.5B:
+
+| System | Model | Request | Latency |
+| --- | --- | --- | ---: |
+| CacheIR CUDA | Qwen2.5-0.5B-Instruct | 16 input + 8 output tokens | 233.774 ms |
+| vLLM CUDA | Qwen2.5-0.5B-Instruct | 16 input + 8 output tokens | 43.697 ms |
+
+CacheIR evidence:
+
+- `compile_model` imported the real Qwen2 config and safetensors shapes.
+- BF16 safetensors shape discovery and loading work through metadata/Torch
+  fallback paths.
+- `CudaRuntime` executed prefill and decode on the local RTX 5070 Laptop GPU.
+- Persistent paged decode attention was used 432 times in the measured run.
+
+vLLM remains 5.35x faster for this 0.5B request shape. That gap is expected:
+vLLM uses mature CUDA graph capture, highly tuned kernels, and a production
+serving scheduler; CacheIR now has the correct compiler/runtime surfaces but
+still uses many Python-level graph steps and dequant-at-GEMM-boundary execution.
+
 ## What The Results Mean
 
 CacheIR is now stronger on three axes:
 
 - It has production-shaped serving surfaces: health, metrics, batch completions,
   prefix reuse, scheduler counters, queue limits, priorities, cancellation,
-  isolated per-request KV state, and CUDA batched prefill/decode rounds exposed
-  through metrics.
+  backpressure waits, fairness aging, resumable preemption, bounded queue-latency
+  counters, isolated per-request KV state, and CUDA batched prefill/decode rounds
+  exposed through metrics.
 - It has a clearer performance posture: fast reference NumPy matmul by default,
   native CPU kernels where they help, GPU kernel microbenchmarks that run on the
   local RTX 5070, an end-to-end CUDA runtime that wins once toy model sizes
   become compute-heavy enough, and a measured scheduler-level CUDA batching
   speedup.
-- It can run a real vLLM CUDA latency benchmark in WSL after fixing no-UVA
-  propagation and installing a toolkit for FlashInfer JIT.
+- It can run real vLLM CUDA latency benchmarks in WSL after fixing no-UVA
+  propagation and installing a toolkit for FlashInfer JIT, including a Qwen2.5
+  0.5B run.
 
-The project is still not a production peer of vLLM/TensorRT-LLM/llama.cpp/MLC
-LLM. The biggest gap is production-grade GPU serving: CacheIR can execute full
-graphs on CUDA and batch scheduler rounds now, but its shared CUDA page allocator
-is still accounting metadata rather than the persistent page-backed storage used
-directly by a production fused attention kernel. The second biggest gap is high-performance GEMM
-and quantization: simulated int4 lowering is useful for compiler behavior, but it
-is not packed int4 inference. The third biggest gap is model scale and coverage:
-the strongest CUDA evidence is still toy-shaped models, not 0.5B/1.5B/7B local
-models.
-
-## Remaining Performance Work
-
-CacheIR needs an end-to-end production CUDA serving loop with persistent
-page-backed attention, packed quantized GEMM, tuned GEMM selection, real model
-coverage beyond toy shapes, and throughput/latency comparisons on 0.5B to
-7B-class models.
+The results mean CacheIR has crossed from toy-only compiler demo into a real
+inspectable transformer compiler/runtime artifact. The performance comparison is
+also clear: vLLM is still far faster on the 0.5B CUDA request measured here, and
+llama.cpp remains the right reference for highly tuned GGUF execution. CacheIR's
+value is the transparent compiler pipeline and increasingly realistic serving
+surface; its next performance gains would come from reducing Python graph
+overhead, replacing dequant-at-GEMM-boundary with fused quantized GEMM kernels,
+and broadening local model coverage beyond the downloaded 0.5B checkpoint.

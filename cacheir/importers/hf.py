@@ -126,8 +126,13 @@ def discover_weight_shapes(model_path: str | Path) -> tuple[dict[str, tuple[int,
         for tensor_file in safetensor_files:
             with safe_open(tensor_file, framework="np") as handle:
                 for key in handle.keys():
-                    tensor = handle.get_tensor(key)
-                    shapes[key] = tuple(int(dim) for dim in tensor.shape)
+                    try:
+                        tensor_slice = handle.get_slice(key)
+                        shape = tensor_slice.get_shape()
+                    except Exception:
+                        tensor = handle.get_tensor(key)
+                        shape = tensor.shape
+                    shapes[key] = tuple(int(dim) for dim in shape)
                     files[key] = tensor_file.name
 
     return shapes, files

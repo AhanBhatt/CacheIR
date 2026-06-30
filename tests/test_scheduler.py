@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from cacheir import ContinuousBatchScheduler, CudaRuntime, Runtime, compile_model, cuda_runtime_available
+from cacheir import ContinuousBatchScheduler, CudaRuntime, GenerationRequest, Runtime, compile_model, cuda_runtime_available
 from cacheir.importers import create_tiny_model
 
 
@@ -67,6 +67,53 @@ def test_scheduler_priority_cancellation_and_queue_limit(tmp_path):
     assert stats["cancelled_requests"] == 1
     assert stats["rejected_requests"] == 1
     assert stats["completed_requests"] == 2
+
+
+def test_scheduler_backpressure_fairness_and_request_limits(tmp_path):
+    artifact = _artifact(tmp_path)
+    scheduler = ContinuousBatchScheduler(
+        artifact,
+        max_batch_size=1,
+        use_prefix_cache=False,
+        max_queue_size=1,
+        fairness_aging_ms=0.001,
+        max_queue_wait_ms=0.0,
+        max_request_tokens=16,
+    )
+    scheduler.submit("first", max_new_tokens=1, priority=0)
+    with pytest.raises(RuntimeError):
+        scheduler.submit("second", max_new_tokens=1, block=True, timeout_s=0.001)
+    with pytest.raises(RuntimeError):
+        scheduler.submit("this request is too long", max_new_tokens=16)
+
+    results = scheduler.run_until_complete()
+    stats = scheduler.stats()["scheduler"]
+
+    assert len(results) == 1
+    assert stats["backpressure_waits"] == 1
+    assert stats["rejected_requests"] == 2
+    assert stats["bounded_latency_violations"] >= 1
+
+
+def test_scheduler_preempts_lower_priority_active_request(tmp_path):
+    artifact = _artifact(tmp_path)
+    scheduler = ContinuousBatchScheduler(
+        artifact,
+        max_batch_size=1,
+        use_prefix_cache=False,
+        preempt_low_priority=True,
+    )
+    low_request = GenerationRequest(prompt="low", max_new_tokens=2, request_id="low", priority=0)
+    active = [scheduler._prefill(low_request)]
+    scheduler.submit("high", max_new_tokens=1, request_id="high", priority=10)
+
+    survivors = scheduler._preempt_for_pending(active)
+    stats = scheduler.stats()["scheduler"]
+
+    assert survivors == []
+    assert len(scheduler._paused) == 1
+    assert scheduler._paused[0].request.request_id == "low"
+    assert stats["preemptions"] == 1
 
 
 def test_server_health_metrics_and_batch_endpoint(tmp_path):
@@ -160,6 +207,42 @@ def test_cuda_runtime_forks_share_page_allocator(tmp_path):
     stats = template.kv_allocator.stats()
     assert stats["allocated_pages_total"] >= 2
     assert stats["resident_pages"] >= 2
+    assert stats["persistent_pools"]
+    assert stats["pool_writes"] >= 2
     first_pages = first.cache_stats()["layers"]["0"]["pages"]
     second_pages = second.cache_stats()["layers"]["0"]["pages"]
     assert first_pages[0]["page_id"] != second_pages[0]["page_id"]
+
+
+def test_cuda_batched_decode_uses_persistent_page_pool_when_triton_attention_enabled(tmp_path):
+    if not cuda_runtime_available():
+        return
+    try:
+        import cacheir.backends.triton_kernels as tk
+    except Exception:
+        return
+    if not tk.triton_available():
+        return
+    model = create_tiny_model(
+        tmp_path / "cuda_persistent_attention_tiny",
+        vocab_size=64,
+        hidden_size=32,
+        intermediate_size=64,
+        num_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+    )
+    artifact = compile_model(model, target="cuda", mode=["prefill", "decode"], max_seq=16)
+    template = CudaRuntime(artifact, dtype="float32", use_triton_elementwise=False, use_triton_attention=True)
+    first = template.fork()
+    second = template.fork()
+
+    first.run([[1, 2]], mode="prefill")
+    second.run([[3, 4]], mode="prefill")
+    logits = template.run_decode_batch([first, second], [5, 6])
+    template.synchronize()
+
+    assert tuple(logits.shape) == (2, 1, 64)
+    counts = template.cache_stats()["kernel_counts"]
+    assert counts.get("triton.paged_attention_decode_batch.persistent_shared", 0) >= 1
+    assert template.kv_allocator.stats()["persistent_pools"]

@@ -118,74 +118,52 @@ python scripts/compare_external_benchmarks.py examples/tiny_artifact \
 
 ## Local Native Experiment Snapshot
 
-Latest local verification on 2026-06-25:
+Latest local verification on 2026-06-29:
 
-- Full optional project install passed with
-  `python -m pip install -e ".[dev,server,importers,benchmark,native,gpu]"`.
-- PyPI packages installed include `pybind11`, `triton-windows`, ONNX/importer
-  dependencies, server dependencies, and benchmark dependencies.
-- MSVC Build Tools 2022 installed at `C:\BuildTools`; `cl.exe` resolves from the
-  user PATH.
-- CUDA Torch installed: `torch 2.12.1+cu130`; CUDA is available on the RTX 5070
-  Laptop GPU.
-- `_cacheir_native.pyd` built with CMake, PyPI pybind11, and the active Python
-  3.13 interpreter.
-- Native smoke reported `simd_backend() == "avx512"`.
-- C++ RMSNorm, matmul, and fused SiLU-multiply matched NumPy within float32 tolerance.
-- Runtime matmul dispatch defaults to NumPy's optimized contraction; native matmul is available as an opt-in kernel experiment.
-- CUDA C++ target built with MSVC/NVCC: `cacheir_cuda_kernels.lib`.
-- CUDA C++ FP16 WMMA Tensor Core matmul and reduced paged-attention decode paths
-  built with MSVC/NVCC.
-- End-to-end `CudaRuntime` executed full decoder artifacts with fp16 weights,
-  GPU-resident KV state, SDPA attention, Triton elementwise dispatch gates, and
-  cached packed QKV/Gate-Up weights.
-- CUDA runtime benchmark crossover results: h1024/l4 CUDA fp16 measured
-  7.533 ms prefill and 7.573 ms/token decode versus CPU fp32 30.984 ms prefill
-  and 12.271 ms/token decode; h2048/l4 CUDA fp16 measured 6.705 ms prefill and
-  7.333 ms/token decode versus CPU fp32 94.036 ms prefill and
-  30.619 ms/token decode.
-- CUDA scheduler benchmark result: h1024/l4 batch-4 variable-length batched
-  prefill plus active decode batching processed 134 real prefill tokens plus 6
-  padding tokens, improving median latency from 582.177 ms to 339.796 ms and
-  generated-token throughput from 109.9 tok/s to 188.3 tok/s. h2048/l4 batch-4
-  improved median latency from 867.240 ms to 684.002 ms and throughput from
-  37.0 tok/s to 46.8 tok/s.
-- Triton batched decode attention smoke test executed through the scheduler path
-  with `--use-triton-attention` on h128/l1 and showed a 3.36x speedup over
-  sequential CUDA sessions for that tiny smoke shape.
+- Full test suite passed with `python -m pytest -q`: 38 passed, 6 warnings in
+  17.47s.
+- `python -m compileall cacheir scripts -q` passed after the production-serving
+  changes.
+- CUDA is available on the RTX 5070 Laptop GPU. The WSL2 CUDA environment at
+  `/home/bhatt/cacheir-llm-venv` contains vLLM 0.23.0, Torch 2.11.0+cu130,
+  FlashInfer, Triton, and llama-cpp-python.
+- `CudaRuntime` now uses persistent page-backed GPU KV pools. The fused Triton
+  decode path consumes the shared page table directly instead of repacking
+  per-request K/V tensors for the scheduler's batch decode.
+- Packed int4 and int8 weight objects store compressed uint8 payloads, per-row
+  scales, affine zero points, and shape metadata. CPU and CUDA loaders route
+  quantized matmul, QKV, and SwiGLU paths through those packed objects.
+- Scheduler hardening covers blocking backpressure, fairness aging,
+  preemption, per-request token limits, bounded latency counters, and queue soak
+  metrics.
+- Persistent CUDA scheduler benchmark on h512/l2 with `--use-triton-attention`
+  improved median latency from 176.225 ms to 78.491 ms and generated-token
+  throughput from 184.0 tok/s to 407.8 tok/s.
+- CUDA runtime benchmark on h512/l2 measured 3.515 ms prefill versus CPU
+  8.800 ms. Decode was 3.264 ms/token on CUDA versus 3.139 ms/token on CPU for
+  that small shape.
 - Triton GPU kernels executed on CUDA and matched Torch references for RMSNorm,
-  SwiGLU, FP16 matmul, single-query decode attention, and multi-batch
+  SwiGLU, FP16 matmul, single-query decode attention, and multi-batch persistent
   page-table decode attention.
+- Qwen2.5-0.5B-Instruct was downloaded locally in WSL2, compiled through the HF
+  importer, and executed on CUDA with bf16 safetensors shape discovery and
+  persistent paged decode.
+- Qwen2.5-0.5B apples-to-apples latency: CacheIR averaged 233.774 ms/request
+  for 16 input + 8 output tokens; vLLM averaged 43.697 ms/request in the same
+  WSL2 CUDA environment after warmup.
+- A CUDA llama.cpp build ran `llama-bench` against a locally converted tiny GGUF
+  Llama model: 6,120.22 prompt tok/s for 16 prompt tokens and 2,044.44
+  generation tok/s for 8 generated tokens.
 - `cacheir profile --calibrate --sample-mb 16 --repeats 5` measured CPU copy at
   32.04 GB/s and CUDA H2D at 13.98 GB/s on this host.
 - `nvidia-cutlass 4.2.0.0` installed successfully; CacheIR detects its
   `cutlass_cppgen` Python surface through the CUTLASS adapter probe.
-- `iree-base-compiler 3.11.0`, `iree-base-runtime 3.11.0`, and
-  `apache-tvm 0.25.0` installed from PyPI.
+- FlashInfer executed through CacheIR's adapter smoke test. FlashAttention,
+  TensorRT-LLM, and MLC LLM remain guarded optional integrations on this host
+  because binary-only PyPI checks found no compatible wheels and source install
+  attempts were not stable in the local WSL2 image.
 - `cacheir external --benchmark --workdir .tmp/upstream` compiled StableHLO
   through IREE to a 9,781-byte VMFB and ran `iree-benchmark-module`; TVM built
   and ran a TE vector-add benchmark with checksum 512.0.
-- WSL2 CUDA environments validated direct FlashAttention prefill and FlashInfer
-  decode execution through CacheIR's adapter wrappers.
-- A CUDA llama.cpp build ran a real `llama-bench` model benchmark against a
-  locally converted GGUF tiny Llama model; the JSON result is in
-  `.tmp/upstream/llama_cpp_tiny_benchmark.json`.
-- The vLLM model benchmark runner installs a process-local no-UVA fallback shim
-  before vLLM workers initialize and prepends both the CacheIR project root and
-  `/usr/local/cuda/bin` to the benchmark environment.
-- WSL2 root installed NVIDIA CUDA Toolkit 13.3 at `/usr/local/cuda`; this gives
-  FlashInfer JIT a real `nvcc` without installing a Linux NVIDIA driver package.
-- A WSL2 CUDA vLLM environment at `/home/bhatt/cacheir-llm-venv` ran vLLM
-  0.23.0 with Torch 2.11.0+cu130 and FlashInfer against a CacheIR-created tiny
-  Llama h128 model. Latest result: 28.535 ms average request latency for
-  16 input + 8 output tokens.
-- Matched CacheIR h128 CPU reference result: 10.553 ms prefill and
-  1.859 ms/token decode, about 25.425 ms estimated full-request latency for the
-  same toy request.
-- Continuous-batch scheduler result: 4 requests, 32 generated tokens, median
-  54.819 ms, 72.97 requests/s, 583.74 generated tokens/s, and 70 prompt tokens
-  reused through prefix cache.
-- Benchmark matrix ran 18 rows: 3 tiny model sizes x fp32/int4_awq x
-  short/medium/long prompts, 3 repeats, 16 decode tokens.
-- The comparison harness ran installed IREE/TVM smoke benchmarks and now exposes
-  model-aware vLLM and llama.cpp helpers when model paths are supplied.
+- The comparison harness now probes and reports vLLM, llama.cpp, TensorRT-LLM,
+  MLC LLM, IREE, and TVM when those systems are installed.

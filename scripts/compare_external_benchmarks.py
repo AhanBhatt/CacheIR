@@ -27,6 +27,8 @@ from cacheir.backends.upstream import (
 KNOWN_TOOLS = {
     "vllm": "vllm",
     "llama.cpp": "llama-bench",
+    "tensorrt_llm": "trtllm-bench",
+    "mlc_llm": "mlc_llm",
     "iree": "iree-benchmark-module",
     "tvm": "tvm",
 }
@@ -81,6 +83,8 @@ def main() -> None:
     parser.add_argument("--vllm-model", default=None)
     parser.add_argument("--llama-command", default=None)
     parser.add_argument("--llama-model", default=None)
+    parser.add_argument("--tensorrt-llm-command", default=None)
+    parser.add_argument("--mlc-llm-command", default=None)
     parser.add_argument("--iree-command", default=None)
     parser.add_argument("--tvm-command", default=None)
     parser.add_argument("--run-installed-smoke", action="store_true", help="run IREE/TVM smoke benchmarks when those wheels are installed and no command is supplied")
@@ -91,6 +95,8 @@ def main() -> None:
     external_commands = {
         "vllm": args.vllm_command,
         "llama.cpp": args.llama_command,
+        "tensorrt_llm": args.tensorrt_llm_command,
+        "mlc_llm": args.mlc_llm_command,
         "iree": args.iree_command,
         "tvm": args.tvm_command,
     }

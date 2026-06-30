@@ -26,6 +26,7 @@ class ByteTokenizer:
 class TokenizerBridge:
     def __init__(self, model_path: str | Path, vocab_size: int):
         self.model_path = Path(model_path)
+        self.vocab_size = max(1, int(vocab_size))
         self.backend = self._load_backend(vocab_size)
 
     def _load_backend(self, vocab_size: int):
@@ -48,11 +49,20 @@ class TokenizerBridge:
         return ByteTokenizer(vocab_size)
 
     def encode(self, text: str) -> list[int]:
+        if not isinstance(text, str):
+            raise TypeError("TokenizerBridge.encode expects a string prompt")
         if hasattr(self.backend, "encode") and self.backend.__class__.__name__ == "Tokenizer":
-            return self.backend.encode(text).ids
-        return self.backend.encode(text)
+            ids = self.backend.encode(text).ids
+        else:
+            ids = self.backend.encode(text)
+        normalized = [int(token) % self.vocab_size for token in ids]
+        return normalized or [0]
 
     def decode(self, token_ids: list[int]) -> str:
+        normalized = [int(token) % self.vocab_size for token in token_ids]
         if hasattr(self.backend, "decode") and self.backend.__class__.__name__ == "Tokenizer":
-            return self.backend.decode(token_ids)
-        return self.backend.decode(token_ids)
+            try:
+                return self.backend.decode(normalized)
+            except Exception:
+                return ByteTokenizer(self.vocab_size).decode(normalized)
+        return self.backend.decode(normalized)

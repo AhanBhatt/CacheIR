@@ -54,6 +54,12 @@ class SchedulerMetrics:
     total_decode_batch_ms: float = 0.0
     total_prefill_ms: float = 0.0
     total_decode_ms: float = 0.0
+    backpressure_waits: int = 0
+    preemptions: int = 0
+    fairness_promotions: int = 0
+    total_queue_wait_ms: float = 0.0
+    max_queue_wait_ms: float = 0.0
+    bounded_latency_violations: int = 0
     started_at: float = field(default_factory=time.perf_counter)
 
     def to_dict(self) -> dict[str, object]:
@@ -95,18 +101,41 @@ class ContinuousBatchScheduler:
         max_batch_size: int = 4,
         use_prefix_cache: bool = True,
         max_queue_size: int | None = None,
+        fairness_aging_ms: float = 250.0,
+        max_queue_wait_ms: float | None = None,
+        preempt_low_priority: bool = True,
+        max_request_tokens: int | None = None,
     ):
         self.template = artifact if _looks_like_runtime(artifact) else Runtime(artifact)
         self.max_batch_size = max(1, int(max_batch_size))
         self.use_prefix_cache = use_prefix_cache
         self.max_queue_size = max_queue_size
+        self.fairness_aging_ms = max(0.0, float(fairness_aging_ms))
+        self.max_queue_wait_ms = max_queue_wait_ms
+        self.preempt_low_priority = bool(preempt_low_priority)
+        self.max_request_tokens = max_request_tokens
         self._pending: list[GenerationRequest] = []
+        self._paused: list[_ActiveRequest] = []
         self._cancelled: set[str] = set()
         self._counter = itertools.count(1)
+        self._arrival_counter = itertools.count(1)
+        self._submitted_at: dict[str, float] = {}
+        self._arrival_order: dict[str, int] = {}
+        self._promoted: set[str] = set()
         self.metrics = SchedulerMetrics()
 
-    def submit(self, prompt: str, *, max_new_tokens: int = 16, request_id: str | None = None, priority: int = 0) -> str:
-        self._check_capacity(1)
+    def submit(
+        self,
+        prompt: str,
+        *,
+        max_new_tokens: int = 16,
+        request_id: str | None = None,
+        priority: int = 0,
+        block: bool = False,
+        timeout_s: float | None = None,
+    ) -> str:
+        self._check_request_tokens(prompt, max_new_tokens)
+        self._check_capacity(1, block=block, timeout_s=timeout_s)
         return self._enqueue(GenerationRequest(prompt=prompt, max_new_tokens=max_new_tokens, request_id=request_id, priority=int(priority)))
 
     def cancel(self, request_id: str) -> bool:
@@ -120,6 +149,8 @@ class ContinuousBatchScheduler:
 
     def submit_many(self, requests: Iterable[GenerationRequest]) -> list[str]:
         request_list = list(requests)
+        for request in request_list:
+            self._check_request_tokens(request.prompt, request.max_new_tokens)
         self._check_capacity(len(request_list))
         request_ids = []
         for request in request_list:
@@ -129,7 +160,15 @@ class ContinuousBatchScheduler:
     def run_until_complete(self) -> list[GenerationResult]:
         active: list[_ActiveRequest] = []
         results: list[GenerationResult] = []
-        while self._pending or active:
+        while self._pending or self._paused or active:
+            capacity = self.max_batch_size - len(active)
+            if self._paused and capacity > 0:
+                active.extend(self._pop_paused(capacity))
+                capacity = self.max_batch_size - len(active)
+            if self._pending and capacity > 0:
+                admitted = [self._pop_pending() for _ in range(min(capacity, len(self._pending)))]
+                active.extend(self._prefill_admitted(admitted))
+            active = self._preempt_for_pending(active)
             capacity = self.max_batch_size - len(active)
             if self._pending and capacity > 0:
                 admitted = [self._pop_pending() for _ in range(min(capacity, len(self._pending)))]
@@ -180,17 +219,60 @@ class ContinuousBatchScheduler:
             "max_batch_size": self.max_batch_size,
             "use_prefix_cache": self.use_prefix_cache,
             "max_queue_size": self.max_queue_size,
+            "fairness_aging_ms": self.fairness_aging_ms,
+            "max_queue_wait_ms": self.max_queue_wait_ms,
+            "preempt_low_priority": self.preempt_low_priority,
+            "max_request_tokens": self.max_request_tokens,
         }
 
     def _pop_pending(self) -> GenerationRequest:
-        best_idx = max(range(len(self._pending)), key=lambda idx: (self._pending[idx].priority, -idx))
+        now = time.perf_counter()
+        best_idx = max(range(len(self._pending)), key=lambda idx: self._pending_score(self._pending[idx], now))
         return self._pending.pop(best_idx)
 
-    def _check_capacity(self, count: int) -> None:
+    def _pop_paused(self, capacity: int) -> list[_ActiveRequest]:
+        capacity = max(0, int(capacity))
+        if capacity <= 0:
+            return []
+        self._paused.sort(key=lambda state: (state.request.priority, len(state.generated_ids)), reverse=True)
+        resumed = self._paused[:capacity]
+        self._paused = self._paused[capacity:]
+        return resumed
+
+    def _pending_score(self, request: GenerationRequest, now: float) -> tuple[float, int]:
+        request_id = request.request_id or ""
+        wait_ms = (now - self._submitted_at.get(request_id, now)) * 1000.0
+        age_bonus = 0.0
+        if self.fairness_aging_ms > 0:
+            age_bonus = wait_ms / self.fairness_aging_ms
+            if age_bonus >= 1.0 and request_id not in self._promoted:
+                self._promoted.add(request_id)
+                self.metrics.fairness_promotions += 1
+        return (float(request.priority) + age_bonus, -self._arrival_order.get(request_id, 0))
+
+    def _check_capacity(self, count: int, *, block: bool = False, timeout_s: float | None = None) -> None:
         count = max(0, int(count))
-        if self.max_queue_size is not None and len(self._pending) + count > int(self.max_queue_size):
-            self.metrics.rejected_requests += count
-            raise RuntimeError("CacheIR scheduler queue is full")
+        if self.max_queue_size is None or len(self._pending) + count <= int(self.max_queue_size):
+            return
+        if block:
+            self.metrics.backpressure_waits += 1
+            deadline = None if timeout_s is None else time.perf_counter() + max(0.0, float(timeout_s))
+            while self.max_queue_size is not None and len(self._pending) + count > int(self.max_queue_size):
+                if deadline is not None and time.perf_counter() >= deadline:
+                    break
+                time.sleep(0.001)
+            if self.max_queue_size is None or len(self._pending) + count <= int(self.max_queue_size):
+                return
+        self.metrics.rejected_requests += count
+        raise RuntimeError("CacheIR scheduler queue is full")
+
+    def _check_request_tokens(self, prompt: str, max_new_tokens: int) -> None:
+        if self.max_request_tokens is None:
+            return
+        total = len(self.template.tokenizer.encode(prompt)) + max(0, int(max_new_tokens))
+        if total > int(self.max_request_tokens):
+            self.metrics.rejected_requests += 1
+            raise RuntimeError("CacheIR request exceeds max_request_tokens")
 
     def _enqueue(self, request: GenerationRequest) -> str:
         assigned_id = request.request_id or f"cacheir-{next(self._counter)}"
@@ -202,10 +284,24 @@ class ContinuousBatchScheduler:
                 priority=int(request.priority),
             )
         )
+        self._submitted_at[assigned_id] = time.perf_counter()
+        self._arrival_order[assigned_id] = next(self._arrival_counter)
         self.metrics.submitted_requests += 1
         return assigned_id
 
+    def _observe_admission(self, request: GenerationRequest) -> None:
+        request_id = request.request_id or ""
+        submitted = self._submitted_at.get(request_id)
+        if submitted is None:
+            return
+        wait_ms = (time.perf_counter() - submitted) * 1000.0
+        self.metrics.total_queue_wait_ms += wait_ms
+        self.metrics.max_queue_wait_ms = max(self.metrics.max_queue_wait_ms, wait_ms)
+        if self.max_queue_wait_ms is not None and wait_ms > float(self.max_queue_wait_ms):
+            self.metrics.bounded_latency_violations += 1
+
     def _prefill(self, request: GenerationRequest) -> _ActiveRequest:
+        self._observe_admission(request)
         runtime = self.template.fork()
         prompt_ids = runtime.tokenizer.encode(request.prompt)
         start = time.perf_counter()
@@ -240,6 +336,8 @@ class ContinuousBatchScheduler:
 
         encoded = [runtime.tokenizer.encode(request.prompt) for request, runtime in zip(requests, runtimes)]
         if _variable_prefill_batch_available(runtimes) and len(requests) > 1 and all(encoded):
+            for request in requests:
+                self._observe_admission(request)
             batch_prefill = getattr(runtimes[0], "run_prefill_batch")
             start = time.perf_counter()
             logits = batch_prefill(runtimes, encoded)
@@ -283,6 +381,8 @@ class ContinuousBatchScheduler:
                 continue
             group_runtimes = [runtimes[idx] for idx in indexes]
             group_tokens = [encoded[idx] for idx in indexes]
+            for idx in indexes:
+                self._observe_admission(requests[idx])
             batch_prefill = getattr(group_runtimes[0], "run_prefill_batch")
             start = time.perf_counter()
             logits = batch_prefill(group_runtimes, group_tokens)
@@ -318,6 +418,7 @@ class ContinuousBatchScheduler:
         prompt_ids: list[int] | None = None,
     ) -> _ActiveRequest:
         prompt_ids = prompt_ids if prompt_ids is not None else runtime.tokenizer.encode(request.prompt)
+        self._observe_admission(request)
         start = time.perf_counter()
         logits, reused_prefix = runtime.prefill_tokens(
             prompt_ids,
@@ -390,6 +491,18 @@ class ContinuousBatchScheduler:
             reused_prefix_tokens=state.reused_prefix_tokens,
             finish_reason=finish_reason,
         )
+
+    def _preempt_for_pending(self, active: list[_ActiveRequest]) -> list[_ActiveRequest]:
+        if not self.preempt_low_priority or not self._pending or not active:
+            return active
+        highest_pending = max(self._pending, key=lambda request: request.priority)
+        lowest_active = min(active, key=lambda state: (state.request.priority, -len(state.generated_ids)))
+        if int(highest_pending.priority) <= int(lowest_active.request.priority):
+            return active
+        survivors = [state for state in active if state is not lowest_active]
+        self._paused.append(lowest_active)
+        self.metrics.preemptions += 1
+        return survivors
 
 
 def _looks_like_runtime(value: object) -> bool:
