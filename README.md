@@ -404,12 +404,6 @@ cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=Release
 cmake --build cpp/build --config Release
 ```
 
-Full project documentation is available as LaTeX source at
-`docs/latex/cacheir_project_documentation.tex`. Generated PDF/ODF outputs and
-LaTeX build products are ignored by `.gitignore`.
-
-The latest benchmark and performance report is in
-`docs/benchmark_performance_report.md`.
 
 Project layout:
 
